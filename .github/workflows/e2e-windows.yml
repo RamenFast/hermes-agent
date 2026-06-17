@@ -63,6 +63,8 @@ jobs:
         run: npm run tauri:build
         working-directory: apps/bootstrap-installer
         timeout-minutes: 10
+        env:
+          HERMES_BUILD_PIN_BRANCH: "main" # build the installer exactly as it would build on `main`. we'll override this when running it.
 
       # Only runs on cache miss. Pick the exe the Tauri build produced and
       # normalize its name so downstream jobs always know what to download.
@@ -76,7 +78,7 @@ jobs:
             'apps/bootstrap-installer/src-tauri/target/release/bundle/app/Hermes_0.0.1_x64-setup.exe',
             'apps/bootstrap-installer/src-tauri/target/release/Hermes.exe'
           )
-          $installer = $null
+          $installer = $nullc
           foreach ($c in $candidates) {
             if (Test-Path $c) {
               $installer = Resolve-Path $c
