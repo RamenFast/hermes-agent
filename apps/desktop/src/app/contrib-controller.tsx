@@ -44,6 +44,7 @@ import { $filePreviewTarget, $previewTarget, closeRightRail } from '@/store/prev
 import { $reviewOpen, closeReview, REVIEW_PANE_ID } from '@/store/review'
 import { $currentCwd } from '@/store/session'
 
+import { watchSessionTiles } from './chat/session-tile'
 import { FilesPane, LogsPane, PreviewRailPane, ReviewPaneContent } from './contrib-panes'
 import { ContribWiring, WiredPane } from './contrib-wiring'
 import { $terminalTakeover, setTerminalTakeover } from './right-sidebar/store'
@@ -87,7 +88,7 @@ registry.registerMany([
     id: 'workspace',
     area: 'panes',
     title: 'main',
-    data: { placement: 'main', minWidth: '22vw' },
+    data: { placement: 'main', minWidth: '22vw', uncloseable: true },
     render: () => <WiredPane part="chatRoutes" />
   },
   {
@@ -284,6 +285,9 @@ discoverBundledPlugins()
 // Plugin panes join the tree by their `placement` hint the moment they
 // register — incl. runtime plugins arriving seconds after boot.
 watchContributedPanes()
+
+// Session tiles: persisted split sessions register panes docked beside main.
+watchSessionTiles()
 
 // ---------------------------------------------------------------------------
 // Titlebar chrome toggles -> tree. The TitlebarControls buttons keep their
