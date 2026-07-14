@@ -295,6 +295,143 @@ def report_deprecated_config_and_env(
     return findings
 
 
+def check_anthropic_oauth_billing(issues: list[str]) -> None:
+    """Probe whether Anthropic OAuth inference is served from the Claude
+    subscription (good) or the extra-usage/overage lane (can incur credits).
+
+    Makes ONE tiny real ``/v1/messages`` call with Hermes's exact OAuth
+    subscription contract (billing system block + betas + claude-cli UA) and
+    inspects the ``anthropic-ratelimit-unified-*`` response headers:
+
+    - ``unified-status: allowed`` + a ``representative-claim`` of ``five_hour``
+      / ``seven_day`` → served from the subscription. Good.
+    - Landing in the overage lane (``overage-status`` active as the serving
+      lane, or a 400 ``out of extra usage``) → billing is NOT on the
+      subscription; this is the regression the version-tracking guards against.
+
+    Prints the detected Claude Code version and the header Hermes will send so
+    the state is legible. Network-bound; only run on request.
+    """
+    _section("Anthropic OAuth Billing Lane")
+
+    key = ""
+    try:
+        # Prefer the full resolver (env → Claude Code creds → credential_pool
+        # OAuth entry, with refresh) so this matches how inference actually gets
+        # its token.  Fall back to the env-only helper.
+        from agent.anthropic_adapter import resolve_anthropic_token
+        key = (resolve_anthropic_token() or "").strip()
+    except Exception:
+        key = ""
+    if not key:
+        try:
+            from hermes_cli.auth import get_anthropic_key
+            key = get_anthropic_key()
+        except Exception:
+            key = ""
+    if not key:
+        check_info("No Anthropic credential configured — skipping billing probe.")
+        return
+
+    try:
+        from agent.anthropic_adapter import (
+            _is_oauth_token,
+            _OAUTH_BETAS,
+            _CLAUDE_CODE_SYSTEM_PREFIX,
+            _claude_code_version,
+            _build_claude_cli_user_agent,
+            _build_oauth_billing_header,
+        )
+    except Exception as e:
+        check_warn("Anthropic OAuth billing", f"(adapter import failed: {e})")
+        return
+
+    if not _is_oauth_token(key):
+        check_info(
+            "Anthropic credential is a direct API key, not OAuth — "
+            "billing lane check only applies to Claude subscription OAuth."
+        )
+        return
+
+    version = _claude_code_version()
+    check_info(f"Claude Code version tracked: {version}")
+    check_info(f"Billing header: {_build_oauth_billing_header()}")
+
+    import uuid as _uuid
+    try:
+        import httpx
+    except Exception as e:  # pragma: no cover
+        check_warn("Anthropic OAuth billing", f"(httpx unavailable: {e})")
+        return
+
+    body = {
+        "model": "claude-fable-5",
+        "max_tokens": 8,
+        "system": [
+            {"type": "text",
+             "text": f"x-anthropic-billing-header: {_build_oauth_billing_header()}"},
+            {"type": "text", "text": _CLAUDE_CODE_SYSTEM_PREFIX},
+        ],
+        "messages": [{"role": "user", "content": "Reply OK"}],
+    }
+    headers = {
+        "authorization": f"Bearer {key}",
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": ",".join(_OAUTH_BETAS),
+        "user-agent": _build_claude_cli_user_agent(),
+        "x-app": "cli",
+        "X-Claude-Code-Session-Id": str(_uuid.uuid4()),
+        "anthropic-dangerous-direct-browser-access": "true",
+    }
+    try:
+        r = httpx.post(
+            "https://api.anthropic.com/v1/messages?beta=true",
+            headers=headers, json=body, timeout=30,
+        )
+    except Exception as e:
+        check_warn("Anthropic OAuth billing", f"(request failed: {e})")
+        return
+
+    h = r.headers
+    status = h.get("anthropic-ratelimit-unified-status", "")
+    claim = h.get("anthropic-ratelimit-unified-representative-claim", "")
+    util_5h = h.get("anthropic-ratelimit-unified-5h-utilization", "")
+
+    if r.status_code == 200 and status == "allowed" and claim in ("five_hour", "seven_day"):
+        check_ok(
+            "Served from Claude subscription",
+            f"(claim={claim}, 5h-util={util_5h or '?'})",
+        )
+        return
+
+    if r.status_code == 400 and "extra usage" in r.text.lower():
+        _fail_and_issue(
+            "Billing routed to extra-usage/overage lane",
+            "(HTTP 400 'out of extra usage')",
+            "Anthropic OAuth billing is NOT on the subscription. The Claude "
+            "Code version fingerprint or OAuth contract may have drifted — "
+            "update Claude Code (`claude update`), then re-run "
+            "`hermes doctor --anthropic-billing`. If it persists, the billing "
+            "system block in agent/anthropic_adapter.py needs refreshing.",
+            issues,
+        )
+        return
+
+    if r.status_code == 200:
+        check_warn(
+            "Anthropic OAuth billing",
+            f"(HTTP 200 but status={status or '?'}, claim={claim or '?'} — "
+            f"unexpected lane; inspect headers)",
+        )
+        return
+
+    check_warn(
+        "Anthropic OAuth billing",
+        f"(HTTP {r.status_code}: {r.text[:120]})",
+    )
+
+
 def _enabled_cli_toolsets_for_doctor() -> set[str] | None:
     """Return toolsets enabled for the CLI, or None if config resolution fails."""
     try:
@@ -2306,6 +2443,12 @@ def run_doctor(args):
             _issues_to_add = []
         for _issue in _issues_to_add:
             issues.append(_issue)
+
+    # Optional deep check: verify Anthropic OAuth inference is billed to the
+    # Claude subscription and not the extra-usage/overage lane. Network-bound
+    # and makes a tiny real inference call, so it is opt-in.
+    if getattr(args, "anthropic_billing", False):
+        check_anthropic_oauth_billing(issues)
 
     _section("Tool Availability")
     try:

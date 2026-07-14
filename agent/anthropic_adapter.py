@@ -371,19 +371,60 @@ _OAUTH_BETAS = [
 
 # Claude Code identity — required for OAuth requests to be routed correctly.
 # Without these, Anthropic's infrastructure intermittently 500s OAuth traffic.
-# The version must stay reasonably current — Anthropic rejects OAuth requests
-# when the spoofed user-agent version is too far behind the actual release.
-_CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
+# The version should track the locally-installed Claude Code so the spoofed
+# User-Agent and billing attribution stay current.  Empirically (2026-07-14)
+# Anthropic does NOT strictly validate the exact version or the ``cch`` build
+# hash on the subscription lane — stale/removed/garbage values still return
+# 200 on the five_hour claim.  We still mirror the local version so that if
+# Anthropic ever tightens validation, Hermes is already sending a real,
+# current fingerprint rather than a frozen literal.  See
+# ``docs/anthropic-oauth-subscription-receipts.md`` for the validation matrix.
+#
+# ``cch`` is Claude Code's short build hash.  We cannot reproduce it from the
+# version alone (it is baked into each release binary), and the live matrix
+# shows it is not gated, so we omit it rather than send a stale value that
+# could look forged if validation is ever added.  ``cc_entrypoint=sdk-cli``
+# matches how jcode/agent-SDK traffic identifies itself.
+_CLAUDE_CODE_VERSION_FALLBACK = "2.1.123"
+_CLAUDE_CODE_ENTRYPOINT = "sdk-cli"
 _claude_code_version_cache: Optional[str] = None
 
 
 def _detect_claude_code_version() -> str:
     """Detect the installed Claude Code version, fall back to a static constant.
 
-    Anthropic's OAuth infrastructure validates the user-agent version and may
-    reject requests with a version that's too old.  Detecting dynamically means
-    users who keep Claude Code updated never hit stale-version 400s.
+    Fast path: the ``claude`` launcher installs versioned binaries under
+    ``~/.local/share/claude/versions/<version>`` and symlinks ``claude`` to the
+    active one, so resolving the symlink target's basename gives the version
+    with no subprocess.  Falls back to ``claude --version`` and finally to a
+    pinned constant.  Mirroring the local install means users who keep Claude
+    Code updated never drift behind a hardcoded version.
     """
+    import re as _re
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    _version_re = _re.compile(r"^\d+\.\d+(?:\.\d+)?")
+
+    # 1) Resolve the launcher symlink → .../versions/<version>[/...]
+    for cmd in ("claude", "claude-code"):
+        path = _shutil.which(cmd)
+        if not path:
+            continue
+        try:
+            real = _Path(path).resolve()
+            for part in (real.name, *reversed(real.parts)):
+                m = _version_re.match(part)
+                if m and _version_re.fullmatch(m.group(0)) and part[0].isdigit():
+                    # Guard against matching an unrelated numeric path segment:
+                    # accept only when a 'versions' ancestor is present, or the
+                    # basename itself is the version.
+                    if "versions" in real.parts or part == real.name:
+                        return m.group(0)
+        except OSError:
+            pass
+
+    # 2) Fall back to `--version` (output like "2.1.208 (Claude Code)").
     import subprocess as _sp
 
     for cmd in ("claude", "claude-code"):
@@ -393,18 +434,40 @@ def _detect_claude_code_version() -> str:
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0 and result.stdout.strip():
-                # Output is like "2.1.74 (Claude Code)" or just "2.1.74"
                 version = result.stdout.strip().split()[0]
                 if version and version[0].isdigit():
                     return version
         except Exception:
             pass
+
+    # 3) Pinned fallback (a known-good version).
     return _CLAUDE_CODE_VERSION_FALLBACK
 
 
-_CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.123 (external, sdk-cli)"
+def _claude_code_version() -> str:
+    """Cached locally-installed Claude Code version (see _detect...)."""
+    global _claude_code_version_cache
+    if _claude_code_version_cache is None:
+        _claude_code_version_cache = _detect_claude_code_version()
+    return _claude_code_version_cache
+
+
+def _build_claude_cli_user_agent(version: Optional[str] = None) -> str:
+    """``claude-cli/<version> (external, sdk-cli)`` — matches Claude Code's UA."""
+    return f"claude-cli/{version or _claude_code_version()} (external, {_CLAUDE_CODE_ENTRYPOINT})"
+
+
+def _build_oauth_billing_header(version: Optional[str] = None) -> str:
+    """Claude Code's ``x-anthropic-billing-header`` value, minus the build hash.
+
+    Format mirrors Claude Code: ``cc_version=<v>; cc_entrypoint=<e>;``.  The
+    ``cch`` build hash is deliberately omitted — it is per-release and not
+    reproducible from the version, and the live matrix shows it is not gated.
+    """
+    return f"cc_version={version or _claude_code_version()}; cc_entrypoint={_CLAUDE_CODE_ENTRYPOINT};"
+
+
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
-_OAUTH_BILLING_HEADER = "cc_version=2.1.123; cc_entrypoint=sdk-cli; cch=33f85;"
 _OAUTH_MAX_OUTPUT_TOKENS = 32_768
 _MCP_TOOL_PREFIX = "mcp__"
 
@@ -451,7 +514,7 @@ def _oauth_attribution_headers(session_id: str | None = None) -> Dict[str, str]:
     """Return jcode/Claude-Agent-SDK attribution headers for subscription use."""
     sid = _oauth_session_id(session_id)
     return {
-        "user-agent": _CLAUDE_CLI_USER_AGENT,
+        "user-agent": _build_claude_cli_user_agent(),
         "x-client-request-id": str(uuid.uuid4()),
         "x-app": "cli",
         "X-Claude-Code-Session-Id": sid,
@@ -467,12 +530,8 @@ def _oauth_attribution_headers(session_id: str | None = None) -> Dict[str, str]:
     }
 
 
-def _get_claude_code_version() -> str:
-    """Lazily detect the installed Claude Code version when OAuth headers need it."""
-    global _claude_code_version_cache
-    if _claude_code_version_cache is None:
-        _claude_code_version_cache = _detect_claude_code_version()
-    return _claude_code_version_cache
+# Back-compat alias: older callers/tests referenced this name.
+_get_claude_code_version = _claude_code_version
 
 
 def _is_oauth_token(key: str) -> bool:
@@ -2646,7 +2705,7 @@ def build_anthropic_kwargs(
         # 1. Prepend Claude Agent SDK billing attribution + identity blocks.
         billing_block = {
             "type": "text",
-            "text": f"x-anthropic-billing-header: {_OAUTH_BILLING_HEADER}",
+            "text": f"x-anthropic-billing-header: {_build_oauth_billing_header()}",
         }
         cc_block = {"type": "text", "text": _CLAUDE_CODE_SYSTEM_PREFIX}
         if isinstance(system, list):

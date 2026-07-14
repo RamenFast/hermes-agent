@@ -38,7 +38,12 @@ class TestOAuthUserAgentPrefix:
         headers = call_kwargs.get("default_headers", {})
         ua = headers.get("user-agent", "") or headers.get("User-Agent", "")
 
-        assert ua == "claude-cli/2.1.123 (external, sdk-cli)"
+        # UA tracks the locally-installed Claude Code version, so assert the
+        # stable shape (claude-cli/<version> (external, sdk-cli)) rather than a
+        # pinned version string.
+        assert re.fullmatch(
+            r"claude-cli/\d+\.\d+(?:\.\d+)? \(external, sdk-cli\)", ua
+        ), ua
         assert "claude-code/" not in ua
 
     def test_inference_has_jcode_attribution_headers(self):

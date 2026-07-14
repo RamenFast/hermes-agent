@@ -32,4 +32,15 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
             "doctor` first to see active advisories and their IDs."
         ),
     )
+    doctor_parser.add_argument(
+        "--anthropic-billing",
+        action="store_true",
+        help=(
+            "Make one tiny real Anthropic OAuth inference call and report "
+            "whether it is served from your Claude subscription (good) or the "
+            "extra-usage/overage lane (which can incur credits). Use this to "
+            "confirm the OAuth subscription contract still routes correctly "
+            "after a Claude Code or Hermes update."
+        ),
+    )
     doctor_parser.set_defaults(func=cmd_doctor)

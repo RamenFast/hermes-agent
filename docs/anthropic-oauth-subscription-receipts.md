@@ -59,3 +59,45 @@ Ported jcode's exact Claude-subscription transport contract into
   tools/memory_tool.py, agent/prompt_builder.py, ...). These are **pre-existing upstream
   drift** from other authors, unrelated to this task, and were left untouched.
 - How to use: `hermes model` (pick Anthropic + a model) or `hermes -z "..." -m claude-opus-4-8 --provider anthropic`.
+
+## Version auto-tracking (2026-07-14 follow-up)
+The billing header (`cc_version`), User-Agent, and `cc_entrypoint` are no longer frozen
+literals — they are **built from the locally-installed Claude Code version** at runtime:
+- `_detect_claude_code_version()` resolves the `claude` launcher symlink target
+  (`~/.local/share/claude/versions/<version>`) with no subprocess, falling back to
+  `claude --version`, then to a pinned constant.
+- `_build_claude_cli_user_agent()` → `claude-cli/<version> (external, sdk-cli)`
+- `_build_oauth_billing_header()` → `cc_version=<version>; cc_entrypoint=sdk-cli;`
+- The per-release **`cch` build hash is deliberately omitted** (not reproducible from the
+  version, and not gated — see matrix below), rather than sending a stale/forged-looking value.
+- So a `hermes update` or `claude update` keeps the fingerprint current automatically; no
+  manual bump.
+
+### Validation matrix (why auto-tracking is safe)
+Live probes against `api.anthropic.com/v1/messages?beta=true` on 2026-07-14 — every variant
+returned **200, `unified-status: allowed`, claim `five_hour`** (subscription lane):
+
+| billing header variant | result |
+|---|---|
+| pinned `2.1.123` + `cch=33f85` (original) | 200 subscription |
+| local `2.1.208` + stale `cch=33f85` | 200 subscription |
+| local `2.1.208`, `cch` removed (what we ship) | 200 subscription |
+| local `2.1.208` + `cch=00000` | 200 subscription |
+| garbage `9.9.9` + `cch=33f85` | 200 subscription |
+| no billing block at all (control) | 200 subscription* |
+
+\* the control also billed to subscription today because there's headroom, but the billing
+block is what deterministically classifies the request — keep it.
+
+**Conclusion:** Anthropic does not currently strictly validate the version or `cch`. Tracking
+the local version is safe and future-proofs against any later tightening.
+
+## Ongoing guard: `hermes doctor --anthropic-billing`
+A network-bound, opt-in doctor check makes one tiny real OAuth inference call and inspects the
+`anthropic-ratelimit-unified-*` headers:
+- **✓ Served from Claude subscription (claim=five_hour, 5h-util=...)** when healthy.
+- **✗ Billing routed to extra-usage/overage lane** (with a `fix`: update Claude Code, re-run,
+  and if it persists, refresh the billing block) if the contract ever drifts.
+It also prints the tracked Claude Code version and the exact header being sent, so the state
+is legible. Plain `hermes doctor` stays offline/fast; the probe only runs with the flag.
+

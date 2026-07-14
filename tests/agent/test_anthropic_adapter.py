@@ -1,6 +1,7 @@
 """Tests for agent/anthropic_adapter.py — Anthropic Messages API adapter."""
 
 import json
+import re
 import sys
 import time
 from types import SimpleNamespace
@@ -78,9 +79,10 @@ class TestBuildAnthropicClient:
             # without that beta reject even short auxiliary requests.
             assert "context-1m-2025-08-07" not in betas
             assert kwargs["default_query"] == {"beta": "true"}
-            assert kwargs["default_headers"]["user-agent"] == (
-                "claude-cli/2.1.123 (external, sdk-cli)"
-            )
+            assert re.fullmatch(
+                r"claude-cli/\d+\.\d+(?:\.\d+)? \(external, sdk-cli\)",
+                kwargs["default_headers"]["user-agent"],
+            ), kwargs["default_headers"]["user-agent"]
             assert "api_key" not in kwargs
 
     def test_oauth_drop_context_1m_beta_strips_only_1m(self):
@@ -1414,10 +1416,13 @@ class TestBuildAnthropicKwargs:
         )
 
         system = kwargs["system"]
-        assert system[0]["text"] == (
-            "x-anthropic-billing-header: "
-            "cc_version=2.1.123; cc_entrypoint=sdk-cli; cch=33f85;"
-        )
+        # Billing header tracks the locally-installed Claude Code version, so
+        # assert the stable shape rather than a pinned version/build-hash.
+        assert re.fullmatch(
+            r"x-anthropic-billing-header: cc_version=\d+\.\d+(?:\.\d+)?; "
+            r"cc_entrypoint=sdk-cli;",
+            system[0]["text"],
+        ), system[0]["text"]
         assert system[1]["text"] == (
             "You are a Claude agent, built on Anthropic's Claude Agent SDK."
         )
