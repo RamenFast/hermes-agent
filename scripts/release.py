@@ -45,6 +45,8 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "225759300+Snowdchike@users.noreply.github.com": "Snowdchike",  # PR #62674 salvage (compaction fabricated 'User asked' stripping; #62365)
+    "114367649+knoal@users.noreply.github.com": "knoal",  # PR #62378 partial salvage (compaction FABRICATION PREVENTION prompt block; #62365)
     "changhyun.min@gmail.com": "minchang",  # PR #42231 salvage (providers: add Upstage Solar)
     "neo@neodeMac-mini.local": "neo-claw-bot",  # PR #58465 salvage (moa: drop empty user turns from advisory view)
     "m.guttmann@journaway.com": "mguttmann",  # PR #63738 salvage (Anthropic setup-token pool auth normalization)
