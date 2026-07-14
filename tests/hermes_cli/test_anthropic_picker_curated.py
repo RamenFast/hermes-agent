@@ -58,3 +58,4 @@ def test_anthropic_falls_back_to_curated_when_live_unavailable():
 
     assert result == list(M._PROVIDER_MODELS["anthropic"])
     assert "claude-fable-5" in result
+    assert "claude-sonnet-5" in result

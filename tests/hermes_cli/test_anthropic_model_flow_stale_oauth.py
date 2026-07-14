@@ -205,3 +205,52 @@ class TestStaleOAuthGuardLogic:
 
         assert existing_is_stale_oauth is False
         assert has_creds is True
+
+
+def test_model_flow_offers_live_anthropic_models(tmp_path, monkeypatch):
+    """The setup wizard must expose live-only Anthropic model IDs.
+
+    ``/model`` already uses the cached live+curated catalog.  The setup flow
+    previously read only the static list, which hid newly released models even
+    when Anthropic's models endpoint advertised them for the current account.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_anthropic_key",
+        lambda: "sk-ant-api03-test",
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.is_claude_code_token_valid",
+        lambda creds: False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_setup_flows._prompt_auth_credentials_choice",
+        lambda title: "use",
+    )
+
+    discovered = ["claude-fable-5", "claude-future-live-only"]
+    monkeypatch.setattr(
+        "hermes_cli.models.cached_provider_model_ids",
+        lambda provider: discovered,
+    )
+    captured = {}
+
+    def _capture_model_list(models, **kwargs):
+        captured["models"] = list(models)
+        return None
+
+    monkeypatch.setattr(
+        "hermes_cli.auth._prompt_model_selection",
+        _capture_model_list,
+    )
+
+    from hermes_cli.main import _model_flow_anthropic
+
+    _model_flow_anthropic({})
+
+    assert captured["models"] == discovered
+    assert "claude-future-live-only" in captured["models"]

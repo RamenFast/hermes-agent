@@ -68,10 +68,19 @@ class TestBuildAnthropicClient:
             assert "oauth-2025-04-20" in betas
             assert "claude-code-20250219" in betas
             assert "interleaved-thinking-2025-05-14" in betas
-            assert "fine-grained-tool-streaming-2025-05-14" in betas
+            assert "context-management-2025-06-27" in betas
+            assert "prompt-caching-scope-2026-01-05" in betas
+            assert "advisor-tool-2026-03-01" in betas
+            assert "advanced-tool-use-2025-11-20" in betas
+            assert "effort-2025-11-24" in betas
+            assert "fine-grained-tool-streaming-2025-05-14" not in betas
             # Native Anthropic does not get context-1m by default; accounts
             # without that beta reject even short auxiliary requests.
             assert "context-1m-2025-08-07" not in betas
+            assert kwargs["default_query"] == {"beta": "true"}
+            assert kwargs["default_headers"]["user-agent"] == (
+                "claude-cli/2.1.123 (external, sdk-cli)"
+            )
             assert "api_key" not in kwargs
 
     def test_oauth_drop_context_1m_beta_strips_only_1m(self):
@@ -89,7 +98,7 @@ class TestBuildAnthropicClient:
             assert "oauth-2025-04-20" in betas
             assert "claude-code-20250219" in betas
             assert "interleaved-thinking-2025-05-14" in betas
-            assert "fine-grained-tool-streaming-2025-05-14" in betas
+            assert "effort-2025-11-24" in betas
 
     def test_api_key_uses_api_key(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
@@ -1389,6 +1398,46 @@ class TestBuildAnthropicKwargs:
             reasoning_config=None,
         )
         assert kwargs["model"] == "claude-sonnet-4-20250514"
+
+    def test_oauth_adds_subscription_billing_identity_and_metadata(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-fable-5",
+            messages=[
+                {"role": "system", "content": "Hermes Agent by Nous Research"},
+                {"role": "user", "content": "Hi"},
+            ],
+            tools=None,
+            max_tokens=128_000,
+            reasoning_config=None,
+            is_oauth=True,
+            oauth_session_id="session-123",
+        )
+
+        system = kwargs["system"]
+        assert system[0]["text"] == (
+            "x-anthropic-billing-header: "
+            "cc_version=2.1.123; cc_entrypoint=sdk-cli; cch=33f85;"
+        )
+        assert system[1]["text"] == (
+            "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+        )
+        assert system[2]["text"] == "Claude Code by Anthropic"
+        metadata = json.loads(kwargs["metadata"]["user_id"])
+        assert metadata["session_id"] == "session-123"
+        assert metadata["device_id"]
+        assert metadata["account_uuid"]
+        assert kwargs["max_tokens"] == 32_768
+
+    def test_api_key_output_cap_is_not_subscription_clamped(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-fable-5",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=128_000,
+            reasoning_config=None,
+            is_oauth=False,
+        )
+        assert kwargs["max_tokens"] == 128_000
 
     def test_fast_mode_oauth_default_omits_context_1m_beta(self):
         """Default OAuth fast-mode avoids context-1m for subscriptions without it."""

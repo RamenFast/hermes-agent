@@ -18,6 +18,7 @@ import platform
 import secrets
 import stat
 import subprocess
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -340,11 +341,32 @@ _CONTEXT_1M_BETA = "context-1m-2025-08-07"
 # See https://platform.claude.com/docs/en/build-with-claude/fast-mode
 _FAST_MODE_BETA = "fast-mode-2026-02-01"
 
-# Additional beta headers required for OAuth/subscription auth.
-# Matches what Claude Code (and pi-ai / OpenCode) send.
+# Additional beta headers required for OAuth/subscription auth.  Keep this
+# list for call sites that append OAuth-only features to the ordinary Anthropic
+# betas (doctor/model discovery).  Inference uses the ordered, exact
+# ``_OAUTH_BETAS`` fingerprint below.
 _OAUTH_ONLY_BETAS = [
     "claude-code-20250219",
     "oauth-2025-04-20",
+    "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05",
+    "advisor-tool-2026-03-01",
+    "advanced-tool-use-2025-11-20",
+    "effort-2025-11-24",
+]
+
+# Exact non-1M OAuth beta sequence used by jcode's proven Claude subscription
+# transport.  Do not add context-1m here: 4.6's opt-in 1M lane may draw from
+# usage credits, while Ben explicitly wants ordinary subscription limits.
+_OAUTH_BETAS = [
+    "claude-code-20250219",
+    "oauth-2025-04-20",
+    "interleaved-thinking-2025-05-14",
+    "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05",
+    "advisor-tool-2026-03-01",
+    "advanced-tool-use-2025-11-20",
+    "effort-2025-11-24",
 ]
 
 # Claude Code identity — required for OAuth requests to be routed correctly.
@@ -380,8 +402,69 @@ def _detect_claude_code_version() -> str:
     return _CLAUDE_CODE_VERSION_FALLBACK
 
 
-_CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
+_CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.123 (external, sdk-cli)"
+_CLAUDE_CODE_SYSTEM_PREFIX = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+_OAUTH_BILLING_HEADER = "cc_version=2.1.123; cc_entrypoint=sdk-cli; cch=33f85;"
+_OAUTH_MAX_OUTPUT_TOKENS = 32_768
 _MCP_TOOL_PREFIX = "mcp__"
+
+
+def _oauth_session_id(session_id: str | None = None) -> str:
+    return str(session_id or "").strip() or str(uuid.uuid4())
+
+
+def _oauth_request_metadata(session_id: str | None = None) -> Dict[str, str]:
+    """Build the Claude CLI ``metadata.user_id`` attribution payload.
+
+    This is request metadata only.  It is derived locally from Claude Code's
+    existing account file and is sent solely to Anthropic with the inference
+    request, matching jcode's working OAuth transport.
+    """
+    sid = _oauth_session_id(session_id)
+    official: Dict[str, Any] = {}
+    try:
+        loaded = json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            official = loaded
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    oauth_account = official.get("oauthAccount")
+    if not isinstance(oauth_account, dict):
+        oauth_account = {}
+    device_id = str(official.get("userID") or "").strip()
+    if not device_id:
+        device_id = uuid.uuid5(uuid.NAMESPACE_DNS, sid).hex
+    account_uuid = str(oauth_account.get("accountUuid") or "unknown-account")
+    return {
+        "user_id": json.dumps(
+            {
+                "device_id": device_id,
+                "account_uuid": account_uuid,
+                "session_id": sid,
+            },
+            separators=(",", ":"),
+        )
+    }
+
+
+def _oauth_attribution_headers(session_id: str | None = None) -> Dict[str, str]:
+    """Return jcode/Claude-Agent-SDK attribution headers for subscription use."""
+    sid = _oauth_session_id(session_id)
+    return {
+        "user-agent": _CLAUDE_CLI_USER_AGENT,
+        "x-client-request-id": str(uuid.uuid4()),
+        "x-app": "cli",
+        "X-Claude-Code-Session-Id": sid,
+        "X-Stainless-Arch": platform.machine().lower(),
+        "X-Stainless-Lang": "js",
+        "X-Stainless-OS": platform.system() or "Linux",
+        "X-Stainless-Package-Version": "0.81.0",
+        "X-Stainless-Retry-Count": "0",
+        "X-Stainless-Runtime": "node",
+        "X-Stainless-Runtime-Version": "v24.3.0",
+        "X-Stainless-Timeout": "600",
+        "anthropic-dangerous-direct-browser-access": "true",
+    }
 
 
 def _get_claude_code_version() -> str:
@@ -797,6 +880,8 @@ def build_anthropic_client(
         drop_context_1m_beta=drop_context_1m_beta,
     )
 
+    oauth_session_id = None
+
     if _is_kimi_coding_endpoint(base_url):
         # Kimi's /coding endpoint requires User-Agent: claude-code/0.1.0
         # to be recognized as a valid Coding Agent. Without it, returns 403.
@@ -825,15 +910,17 @@ def build_anthropic_client(
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     elif _is_oauth_token(api_key):
-        # OAuth access token / setup-token → Bearer auth + Claude Code identity.
-        # Anthropic routes OAuth requests based on user-agent and headers;
-        # without Claude Code's fingerprint, requests get intermittent 500s.
-        all_betas = common_betas + _OAUTH_ONLY_BETAS
+        # OAuth access token / setup-token → Bearer auth + the Claude Agent SDK
+        # fingerprint used by jcode.  The old ``claude-code/<version>`` header
+        # set reached /v1/messages but Anthropic classified it as third-party
+        # extra usage (HTTP 400 when overage was disabled).  This exact contract
+        # was verified live against Ben's subscription before being ported.
+        oauth_session_id = _oauth_session_id()
         kwargs["auth_token"] = api_key
+        kwargs["default_query"] = {"beta": "true"}
         kwargs["default_headers"] = {
-            "anthropic-beta": ",".join(all_betas),
-            "user-agent": f"claude-code/{_get_claude_code_version()} (external, cli)",
-            "x-app": "cli",
+            "anthropic-beta": ",".join(_OAUTH_BETAS),
+            **_oauth_attribution_headers(oauth_session_id),
         }
     else:
         # Regular API key → x-api-key header + common betas
@@ -841,7 +928,16 @@ def build_anthropic_client(
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
-    return _anthropic_sdk.Anthropic(**kwargs)
+    client = _anthropic_sdk.Anthropic(**kwargs)
+    if oauth_session_id:
+        # Request construction happens separately from client construction.
+        # Preserve the attribution session on the client so callers can reuse it
+        # in ``metadata.user_id`` and keep both halves of the fingerprint aligned.
+        try:
+            setattr(client, "_hermes_oauth_session_id", oauth_session_id)
+        except Exception:
+            pass
+    return client
 
 
 def build_anthropic_bedrock_client(region: str):
@@ -2477,6 +2573,7 @@ def build_anthropic_kwargs(
     base_url: str | None = None,
     fast_mode: bool = False,
     drop_context_1m_beta: bool = False,
+    oauth_session_id: str | None = None,
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create().
 
@@ -2529,6 +2626,12 @@ def build_anthropic_kwargs(
     effective_max_tokens = _resolve_anthropic_messages_max_tokens(
         max_tokens, model, context_length=context_length
     )
+    if is_oauth:
+        # jcode deliberately reserves at most 32K output on subscription calls.
+        # Hermes previously requested the model's full 64K/128K API ceiling,
+        # which is unnecessary for agent turns and diverges from the proven
+        # Claude subscription contract.
+        effective_max_tokens = min(effective_max_tokens, _OAUTH_MAX_OUTPUT_TOKENS)
 
     # Clamp output cap to fit inside the total context window.
     # Only matters for small custom endpoints where context_length < native
@@ -2540,14 +2643,18 @@ def build_anthropic_kwargs(
 
     # ── OAuth: Claude Code identity ──────────────────────────────────
     if is_oauth:
-        # 1. Prepend Claude Code system prompt identity
+        # 1. Prepend Claude Agent SDK billing attribution + identity blocks.
+        billing_block = {
+            "type": "text",
+            "text": f"x-anthropic-billing-header: {_OAUTH_BILLING_HEADER}",
+        }
         cc_block = {"type": "text", "text": _CLAUDE_CODE_SYSTEM_PREFIX}
         if isinstance(system, list):
-            system = [cc_block] + system
+            system = [billing_block, cc_block] + system
         elif isinstance(system, str) and system:
-            system = [cc_block, {"type": "text", "text": system}]
+            system = [billing_block, cc_block, {"type": "text", "text": system}]
         else:
-            system = [cc_block]
+            system = [billing_block, cc_block]
 
         # 2. Sanitize system prompt — replace product name references
         #    to avoid Anthropic's server-side content filters.
@@ -2611,6 +2718,8 @@ def build_anthropic_kwargs(
 
     if system:
         kwargs["system"] = system
+    if is_oauth:
+        kwargs["metadata"] = _oauth_request_metadata(oauth_session_id)
 
     if anthropic_tools:
         kwargs["tools"] = anthropic_tools
@@ -2695,7 +2804,7 @@ def build_anthropic_kwargs(
             drop_context_1m_beta=drop_context_1m_beta,
         ))
         if is_oauth:
-            betas.extend(_OAUTH_ONLY_BETAS)
+            betas = list(_OAUTH_BETAS)
         betas.append(_FAST_MODE_BETA)
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 

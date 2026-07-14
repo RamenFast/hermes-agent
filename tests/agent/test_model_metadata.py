@@ -1077,14 +1077,20 @@ class TestGetModelContextLength:
             )
             assert ctx2 == 1000000, f"Expected 1000000, got {ctx2}"
 
+            ctx3 = get_model_context_length(
+                "claude-sonnet-5",
+                base_url="https://my-gateway.example.com/v1/claude",
+            )
+            assert ctx3 == 1000000, f"Expected 1000000, got {ctx3}"
+
             # An unknown model on a custom endpoint should still fall back
             # to 256K (no catalog match).
-            ctx3 = get_model_context_length(
+            ctx4 = get_model_context_length(
                 "totally-unknown-model",
                 base_url="https://my-gateway.example.com/v1/claude",
             )
-            assert ctx3 == DEFAULT_FALLBACK_CONTEXT, (
-                f"Expected {DEFAULT_FALLBACK_CONTEXT}, got {ctx3}"
+            assert ctx4 == DEFAULT_FALLBACK_CONTEXT, (
+                f"Expected {DEFAULT_FALLBACK_CONTEXT}, got {ctx4}"
             )
 
 

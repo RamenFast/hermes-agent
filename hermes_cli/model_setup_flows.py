@@ -2923,7 +2923,7 @@ def _model_flow_anthropic(config, current_model=""):
         save_config,
         save_anthropic_api_key,
     )
-    from hermes_cli.models import _PROVIDER_MODELS
+    from hermes_cli.models import _PROVIDER_MODELS, cached_provider_model_ids
 
     # Check ALL credential sources
     from hermes_cli.auth import get_anthropic_key
@@ -3025,7 +3025,14 @@ def _model_flow_anthropic(config, current_model=""):
     print()
 
     # Model selection
-    model_list = _PROVIDER_MODELS.get("anthropic", [])
+    # Match the runtime ``/model`` picker: merge the curated aliases with
+    # Anthropic's live catalog so newly released and account-visible models are
+    # selectable here without waiting for a Hermes release.  The curated list
+    # remains the offline fallback when discovery is unavailable.
+    model_list = (
+        cached_provider_model_ids("anthropic")
+        or _PROVIDER_MODELS.get("anthropic", [])
+    )
     if model_list:
         selected = _prompt_model_selection(
             model_list,
