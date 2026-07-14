@@ -4400,6 +4400,38 @@ class TestRunConversation:
         assert payload_built is False
         assert hook_called is False
 
+    def test_api_request_error_hook_logs_to_request_error_logger(self, agent, monkeypatch, caplog):
+        # Even with no observability plugin registered, the hook must record the
+        # request error to the dedicated ``hermes.request_errors`` logger so
+        # otherwise-silent response-level fallbacks are visible — and must NOT
+        # leak prompt/response content.
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+
+        with caplog.at_level(logging.DEBUG, logger="hermes.request_errors"):
+            agent._invoke_api_request_error_hook(
+                task_id="task-1",
+                turn_id="turn-1",
+                api_request_id="api-xyz",
+                api_call_count=3,
+                api_start_time=0.0,
+                api_kwargs={"messages": [{"role": "user", "content": "SECRET_PROMPT_TEXT"}]},
+                error_type="InvalidAPIResponse",
+                error_message="empty content, stop_reason=None",
+                status_code=None,
+                reason="invalid_response",
+                retryable=True,
+            )
+
+        records = [r for r in caplog.records if r.name == "hermes.request_errors"]
+        assert len(records) == 1
+        msg = records[0].getMessage()
+        assert records[0].levelno == logging.WARNING
+        assert "InvalidAPIResponse" in msg
+        assert "api-xyz" in msg
+        assert "invalid_response" in msg
+        # Prompt / response content must never reach this log.
+        assert "SECRET_PROMPT_TEXT" not in msg
+
     def test_request_scoped_api_hooks_skip_payload_work_without_listeners(self, agent, monkeypatch):
         self._setup_agent(agent)
         agent.client.chat.completions.create.return_value = _mock_response(

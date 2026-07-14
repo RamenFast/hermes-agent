@@ -2600,6 +2600,34 @@ class AIAgent:
         retryable: Optional[bool] = None,
         reason: Optional[str] = None,
     ) -> None:
+        # Always record the request error to the dedicated request-error log
+        # (``request_errors.log``) regardless of whether an observability
+        # plugin is registered — this is the durable trail for otherwise-silent
+        # response-level fallbacks (empty/malformed responses, HTTP-200 safety
+        # refusals) that switch providers without recording a reason.
+        # Metadata only: no prompt, response body, token counts, or credentials.
+        try:
+            logging.getLogger("hermes.request_errors").warning(
+                "request error: error_type=%s provider=%s model=%s api_mode=%s "
+                "status=%s reason=%s retryable=%s retry=%s/%s api_call=%s "
+                "elapsed=%.2fs api_request_id=%s summary=%s",
+                error_type,
+                self.provider,
+                self.model,
+                getattr(self, "api_mode", None),
+                status_code,
+                reason,
+                retryable,
+                retry_count,
+                max_retries,
+                api_call_count,
+                max(0.0, time.time() - api_start_time),
+                api_request_id,
+                error_message,
+            )
+        except Exception:
+            pass
+
         # Lazy module import (not from-import) so tests that
         # ``monkeypatch.setattr("hermes_cli.plugins.has_hook", ...)`` still
         # take effect on this call site. After first call the import is a

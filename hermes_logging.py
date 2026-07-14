@@ -337,6 +337,24 @@ def setup_logging(
         formatter=RedactingFormatter(_LOG_FORMAT),
     )
 
+    # --- request_errors.log (DEBUG+, request/provider errors only) ---------
+    # Dedicated home for per-request inference errors — including the
+    # response-level fallbacks (empty/malformed responses, HTTP-200 safety
+    # refusals) that otherwise switch providers without recording a reason.
+    # Scoped by ``_ComponentFilter`` to the ``hermes.request_errors`` logger so
+    # this file stays a focused, per-chat-filterable (by [session_id]) trail
+    # and never becomes a catch-all.  File-only: nothing here reaches the
+    # gateway console or the agent's own output.
+    _add_rotating_handler(
+        root,
+        log_dir / "request_errors.log",
+        level=logging.DEBUG,
+        max_bytes=2 * 1024 * 1024,
+        backup_count=3,
+        formatter=RedactingFormatter(_LOG_FORMAT),
+        log_filter=_ComponentFilter(("hermes.request_errors",)),
+    )
+
     # --- gateway.log (INFO+, gateway component only) ------------------------
     if mode == "gateway":
         _add_rotating_handler(

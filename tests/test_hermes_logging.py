@@ -92,10 +92,23 @@ class TestSetupLogging:
         error_handlers = [
             h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
-            and "errors.log" in getattr(h, "baseFilename", "")
+            and getattr(h, "baseFilename", "").endswith("errors.log")
+            and "request_errors.log" not in getattr(h, "baseFilename", "")
         ]
         assert len(error_handlers) == 1
         assert error_handlers[0].level == logging.WARNING
+
+    def test_creates_request_errors_log_handler(self, hermes_home):
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+
+        request_error_handlers = [
+            h for h in hermes_logging.rotating_file_handlers()
+            if isinstance(h, RotatingFileHandler)
+            and getattr(h, "baseFilename", "").endswith("request_errors.log")
+        ]
+        assert len(request_error_handlers) == 1
+        # DEBUG-level, dedicated home for per-request inference errors.
+        assert request_error_handlers[0].level == logging.DEBUG
 
     def test_idempotent_no_duplicate_handlers(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home)
