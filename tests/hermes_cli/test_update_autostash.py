@@ -800,6 +800,75 @@ def test_real_update_rebase_conflict_aborts_and_restores_everything(
     assert not any(cmd[1:3] == ["reset", "--hard"] for cmd in recorded)
 
 
+def test_real_update_restore_conflict_rolls_back_update_and_exits_4(
+    monkeypatch, tmp_path, capsys
+):
+    repos = _make_real_update_repo(tmp_path)
+    old_tip = _git(repos.run, repos.checkout, "rev-parse", "HEAD").stdout.strip()
+    _commit_file(
+        repos.run,
+        repos.upstream,
+        "conflict.txt",
+        "remote version\n",
+        "remote conflicting change",
+    )
+    _git(repos.run, repos.upstream, "push", "origin", "main")
+    _make_dirty(repos.checkout)
+    (repos.checkout / "conflict.txt").write_text("local dirty version\n")
+
+    run, recorded = _prepare_real_cmd_update(monkeypatch, repos.checkout)
+    with pytest.raises(SystemExit, match="4"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+
+    output = capsys.readouterr().out
+    assert "hit conflicts" in output
+    assert "Rolling the update back" in output
+    assert "fix:" in output
+    assert "resolve-rebase.md" in output
+    assert _git(run, repos.checkout, "rev-parse", "HEAD").stdout.strip() == old_tip
+    assert (repos.checkout / "conflict.txt").read_text() == "local dirty version\n"
+    assert (
+        _git(run, repos.checkout, "diff", "--name-only", "--diff-filter=U").stdout.strip()
+        == ""
+    )
+    _assert_dirty_state_and_no_stash(run, repos.checkout)
+
+
+def test_real_update_restore_conflict_after_clean_rebase_keeps_local_commits(
+    monkeypatch, tmp_path, capsys
+):
+    repos = _make_real_update_repo(tmp_path)
+    local_message = "permanent local patch"
+    _commit_file(repos.run, repos.checkout, "local.txt", "local\n", local_message)
+    pre_update_head = _git(repos.run, repos.checkout, "rev-parse", "HEAD").stdout.strip()
+    _commit_file(
+        repos.run,
+        repos.upstream,
+        "conflict.txt",
+        "remote version\n",
+        "remote conflicting change",
+    )
+    _git(repos.run, repos.upstream, "push", "origin", "main")
+    _make_dirty(repos.checkout)
+    (repos.checkout / "conflict.txt").write_text("local dirty version\n")
+
+    run, recorded = _prepare_real_cmd_update(monkeypatch, repos.checkout)
+    with pytest.raises(SystemExit, match="4"):
+        hermes_main.cmd_update(SimpleNamespace(yes=True))
+
+    assert ["git", "rebase", "origin/main"] in recorded
+    assert _git(run, repos.checkout, "rev-parse", "HEAD").stdout.strip() == pre_update_head
+    assert local_message in _git(
+        run, repos.checkout, "log", "--format=%s"
+    ).stdout.splitlines()
+    assert (repos.checkout / "conflict.txt").read_text() == "local dirty version\n"
+    assert (
+        _git(run, repos.checkout, "diff", "--name-only", "--diff-filter=U").stdout.strip()
+        == ""
+    )
+    _assert_dirty_state_and_no_stash(run, repos.checkout)
+
+
 def test_real_update_without_local_commits_fast_forwards(monkeypatch, tmp_path):
     repos = _make_real_update_repo(tmp_path)
     remote_sha = _commit_file(

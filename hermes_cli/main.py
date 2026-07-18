@@ -6765,6 +6765,7 @@ def _restore_stashed_changes(
     stash_ref: str,
     prompt_user: bool = False,
     input_fn=None,
+    on_conflict_rollback_to: str | None = None,
 ) -> bool:
     if prompt_user:
         print()
@@ -6817,6 +6818,123 @@ def _restore_stashed_changes(
 
         print("\nYour stashed changes are preserved — nothing is lost.")
         print(f"  Stash ref: {stash_ref}")
+
+        if on_conflict_rollback_to:
+            # Rebase-or-safe-abort, restore edition: finishing the update on a
+            # tree stripped of the local changes silently changes behavior, and
+            # the half-restored conflict state bricks every later import. Put
+            # code AND local changes back exactly as they were, then exit 4 so
+            # the caller (or the night maintainer) resolves the conflict
+            # deliberately instead of inheriting a broken or vanilla install.
+            print(f"\n→ Rolling the update back to {on_conflict_rollback_to[:10]}...")
+            clear_conflicts = subprocess.run(
+                git_cmd + ["reset", "--hard", "HEAD"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+            rollback = subprocess.run(
+                git_cmd + ["reset", "--hard", on_conflict_rollback_to],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+            if clear_conflicts.returncode == 0 and rollback.returncode == 0:
+                # The failed apply above already dropped the stash's untracked
+                # files into the tree, and reset --hard doesn't remove
+                # untracked paths — so a second apply refuses with "already
+                # exists". Delete exactly the untracked paths recorded in the
+                # stash (their canonical bytes are the stash's third parent,
+                # about to be re-applied); never touch other untracked files.
+                stash_untracked = subprocess.run(
+                    git_cmd + ["ls-tree", "-r", "--name-only", f"{stash_ref}^3"],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                )
+                if stash_untracked.returncode == 0:
+                    for rel in stash_untracked.stdout.splitlines():
+                        rel = rel.strip()
+                        if not rel:
+                            continue
+                        collision = cwd / rel
+                        if not collision.is_file():
+                            continue
+                        tracked = subprocess.run(
+                            git_cmd + ["ls-files", "--error-unmatch", rel],
+                            cwd=cwd,
+                            capture_output=True,
+                            text=True,
+                        )
+                        if tracked.returncode != 0:
+                            try:
+                                collision.unlink()
+                            except OSError:
+                                pass
+                reapply = subprocess.run(
+                    git_cmd + ["stash", "apply", stash_ref],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                )
+                reapply_unmerged = subprocess.run(
+                    git_cmd + ["diff", "--name-only", "--diff-filter=U"],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                )
+                if reapply.returncode == 0 and not reapply_unmerged.stdout.strip():
+                    stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
+                    if stash_selector is not None:
+                        subprocess.run(
+                            git_cmd + ["stash", "drop", stash_selector],
+                            cwd=cwd,
+                            capture_output=True,
+                            text=True,
+                        )
+                    print(
+                        "  ✓ Rollback complete — the code and your local changes are"
+                    )
+                    print("    exactly as they were before the update.")
+                else:
+                    # Never leave a half-applied conflict state, even here.
+                    subprocess.run(
+                        git_cmd + ["reset", "--hard", "HEAD"],
+                        cwd=cwd,
+                        capture_output=True,
+                    )
+                    print(
+                        "  ⚠ Re-applying your changes on the pre-update commit also"
+                    )
+                    print(
+                        f"    conflicted (unexpected). They remain in the stash: git stash apply {stash_ref}"
+                    )
+                print(
+                    "✗ Update stopped: local changes conflict with the new upstream code."
+                )
+                print(
+                    "fix: resolve the local-changes-vs-upstream conflict in a rehearsal worktree, "
+                    "then rerun: hermes update"
+                )
+                try:
+                    from hermes_constants import display_hermes_home as _dhh_fn
+
+                    playbook_home = _dhh_fn()
+                except Exception:
+                    playbook_home = "~/.hermes"
+                print(
+                    f"     playbook: {playbook_home}/skills/hermes-update-patches/resolve-rebase.md"
+                )
+            else:
+                err = (rollback.stderr or clear_conflicts.stderr or "").strip()
+                print("  ✗ Rollback failed. Recover manually with:")
+                print(
+                    f"    cd {cwd} && git reset --hard {on_conflict_rollback_to} && "
+                    f"git stash apply {stash_ref}"
+                )
+                if err:
+                    print(f"    ({err.splitlines()[0]})")
+            sys.exit(4)
 
         # Always reset to clean state — leaving conflict markers in source
         # files makes hermes completely unrunnable (SyntaxError on import).
@@ -10568,6 +10686,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         auto_stash_ref,
                         prompt_user=prompt_for_restore,
                         input_fn=gw_input_fn,
+                        on_conflict_rollback_to=pre_pull_sha or None,
                     )
 
         _invalidate_update_cache()
