@@ -181,9 +181,31 @@ def show_status(args):
         display = redact_key(value)
         print(f"  {name:<12}  {check_mark(has_key)} {display}")
 
-    from hermes_cli.auth import get_anthropic_key
-    anthropic_value = get_anthropic_key()
+    # Seam-ledger #2 ("claims carry their check"): the env-var-only lookup said
+    # "✗ not set" while claude-opus-4-8 was live as the default provider over
+    # OAuth. Resolve through the SAME chain the API path uses (env vars →
+    # Claude Code credentials → hermes PKCE file → credential pool) and name
+    # the source, so the status line can't contradict a working substrate.
+    anthropic_value = ""
+    anthropic_source = ""
+    try:
+        from hermes_cli.auth import get_anthropic_key
+        anthropic_value = get_anthropic_key()
+        if anthropic_value:
+            anthropic_source = "env"
+    except Exception:
+        pass
+    if not anthropic_value:
+        try:
+            from agent.anthropic_adapter import resolve_anthropic_token
+            anthropic_value = resolve_anthropic_token() or ""
+            if anthropic_value:
+                anthropic_source = "oauth"
+        except Exception:
+            pass
     anthropic_display = redact_key(anthropic_value)
+    if anthropic_source == "oauth":
+        anthropic_display = f"{anthropic_display} (OAuth)"
     print(f"  {'Anthropic':<12}  {check_mark(bool(anthropic_value))} {anthropic_display}")
 
     # =========================================================================
