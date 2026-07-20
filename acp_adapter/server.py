@@ -1872,11 +1872,24 @@ class HermesACPAgent(acp.Agent):
             stop_reason = "refusal"
         else:
             stop_reason = "end_turn"
-        field_meta = None
+        # The turn's SUBSTRATE, honestly (jots 09:03 + 09:06): which model actually
+        # answered, and whether the primary fell back. The client shows the model
+        # beside the message timestamp and renders a seam line on fallback — the
+        # substrate never changes silently.
+        nexus_meta: dict = {}
+        turn_model = getattr(state.agent, "model", None) or state.model
+        turn_provider = getattr(state.agent, "provider", None)
+        if turn_model:
+            nexus_meta["model"] = str(turn_model)
+        if turn_provider:
+            nexus_meta["provider"] = str(turn_provider)
+        if getattr(state.agent, "_fallback_activated", False):
+            nexus_meta["fallback"] = True
         if turn_failed and failure_report:
             # Carry the report where clients can render a real error surface
             # (fix-bearing, never wearing the resident's face).
-            field_meta = {"nexus": {"turnError": failure_report[:2000]}}
+            nexus_meta["turnError"] = failure_report[:2000]
+        field_meta = {"nexus": nexus_meta} if nexus_meta else None
         return PromptResponse(stop_reason=stop_reason, usage=usage, field_meta=field_meta)
 
     # ---- Slash commands (headless) -------------------------------------------
