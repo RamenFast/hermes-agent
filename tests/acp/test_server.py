@@ -290,6 +290,7 @@ class TestSessionOps:
             "compact",
             "steer",
             "queue",
+            "status",
             "version",
         ]
         model_cmd = next(
@@ -1440,9 +1441,12 @@ class TestPrompt:
             for call in mock_conn.session_update.await_args_list
         ]
         info_updates = [u for u in updates if isinstance(u, SessionInfoUpdate)]
-        assert len(info_updates) == 1
-        assert info_updates[0].session_update == "session_info_update"
-        assert info_updates[0].title == "Fix Zed titles"
+        # new_session/load_session also push an initial title sync (P3.2), which
+        # may drain during this prompt — the auto-title update must be present
+        # and carry the new title; an extra initial sync is fine.
+        assert len(info_updates) >= 1
+        assert all(u.session_update == "session_info_update" for u in info_updates)
+        assert info_updates[-1].title == "Fix Zed titles"
 
     @pytest.mark.asyncio
     async def test_prompt_populates_usage_from_top_level_run_conversation_fields(self, agent):

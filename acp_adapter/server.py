@@ -524,6 +524,7 @@ class HermesACPAgent(acp.Agent):
         "compact": "Compress conversation context",
         "steer": "Inject guidance into the currently running agent turn",
         "queue": "Queue a prompt to run after the current turn finishes",
+        "status": "Show session status: model, provider, register, context, session ids",
         "version": "Show Hermes version",
     }
 
@@ -562,6 +563,10 @@ class HermesACPAgent(acp.Agent):
             "name": "queue",
             "description": "Queue a prompt to run after the current turn finishes",
             "input_hint": "prompt to run next",
+        },
+        {
+            "name": "status",
+            "description": "Show session status: model, provider, register, context",
         },
         {
             "name": "version",
@@ -1236,6 +1241,12 @@ class HermesACPAgent(acp.Agent):
         )
         self._schedule_available_commands_update(state.session_id)
         self._schedule_usage_update(state)
+        # P3.2 (title sync): push the persisted title (if any) right away so a
+        # client that renders session_info_update titles is current from frame
+        # one — not only after the next auto-title/rotation event.
+        asyncio.get_event_loop().create_task(
+            self._send_session_info_update(state.session_id)
+        )
         return NewSessionResponse(
             session_id=state.session_id,
             models=self._build_model_state(state),
@@ -1294,6 +1305,10 @@ class HermesACPAgent(acp.Agent):
             )
         self._schedule_available_commands_update(session_id)
         self._schedule_usage_update(state)
+        # P3.2 (title sync): the hermes-side title lands with the load, not a turn later.
+        asyncio.get_event_loop().create_task(
+            self._send_session_info_update(session_id)
+        )
         return LoadSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
@@ -1930,6 +1945,7 @@ class HermesACPAgent(acp.Agent):
             "compact": self._cmd_compact,
             "steer": self._cmd_steer,
             "queue": self._cmd_queue,
+            "status": self._cmd_status,
             "version": self._cmd_version,
         }.get(cmd)
 
@@ -1948,6 +1964,26 @@ class HermesACPAgent(acp.Agent):
             lines.append(f"  /{cmd:10s}  {desc}")
         lines.append("")
         lines.append("Unrecognized /commands are sent to the model as normal messages.")
+        return "\n".join(lines)
+
+    def _cmd_status(self, args: str, state: SessionState) -> str:
+        """Session status at a glance (jot 09:03 — /status should be available)."""
+        agent = state.agent
+        model = state.model or getattr(agent, "model", "unknown")
+        provider = getattr(agent, "provider", None) or "auto"
+        base_url = str(getattr(agent, "base_url", "") or "")
+        register = getattr(state, "session_class", "workspace")
+        msgs = len(state.history or [])
+        hermes_id = getattr(agent, "session_id", None) or "?"
+        lines = [
+            f"Model:     {model}",
+            f"Provider:  {provider}" + (f" ({base_url})" if base_url else ""),
+            f"Register:  {register}",
+            f"Context:   {msgs} messages",
+            f"Session:   acp {state.session_id[:12]} · hermes {str(hermes_id)[:12]}",
+        ]
+        if getattr(agent, "_fallback_activated", False):
+            lines.append("Substrate: FALLBACK active (primary unavailable)")
         return "\n".join(lines)
 
     def _cmd_model(self, args: str, state: SessionState) -> str:
