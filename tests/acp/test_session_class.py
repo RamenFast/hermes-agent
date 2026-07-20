@@ -500,4 +500,70 @@ class TestListSessionsRegister:
         assert row["session_class"] == "home"
 
 
+class TestRealAgentBoot:
+    """End-to-end proof (no prompt mocks, real _make_agent + real system-prompt
+    assembly, no LLM call) that the home register is a GENUINE different boot —
+    the adjudication's honesty clause #1 ("not a costume over a coding agent").
+
+    A dummy provider is injected so a real AIAgent constructs under the hermetic
+    (credential-free) CI harness; no network call is made — we only assemble the
+    system prompt, which is a pure local operation.
+    """
+
+    def _boot_and_assemble(self, tmp_path, monkeypatch, session_class):
+        # A distinct SOUL marker proves the resident identity actually loads,
+        # and an AGENTS.md in cwd proves the workspace landing is dropped for home.
+        (tmp_path / "SOUL.md").write_text(
+            "# I am Nexus, the resident.\nNEXUS_SOUL_MARKER_XYZZY\n"
+        )
+        (tmp_path / "AGENTS.md").write_text("WORKSPACE_AGENTS_MARKER_ZZZ\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+        # Inject a resolvable dummy provider so a REAL AIAgent constructs without
+        # live credentials. No LLM call happens — we only assemble the prompt.
+        fake_config = {
+            "model": {"default": "fake-model", "provider": "custom"},
+            "mcp_servers": {},
+        }
+        monkeypatch.setattr(
+            "acp_adapter.session.load_config", lambda: fake_config, raising=False
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config", lambda: fake_config, raising=False
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": "custom",
+                "api_mode": "chat_completions",
+                "base_url": "https://example.invalid/v1",
+                "api_key": "test-key",
+            },
+            raising=False,
+        )
+
+        mgr = SessionManager()  # real _make_agent, real AIAgent
+        state = mgr.create_session(cwd=str(tmp_path), session_class=session_class)
+        return state.session_class, state.agent._build_system_prompt()
+
+    def test_home_boot_is_soul_not_coding(self, tmp_path, monkeypatch):
+        cls, sp = self._boot_and_assemble(tmp_path, monkeypatch, "home")
+        assert cls == "home"
+        # Genuinely her: SOUL identity present.
+        assert "NEXUS_SOUL_MARKER_XYZZY" in sp
+        # Genuinely NOT a coding agent: the operating brief cause is absent.
+        assert "coding agent pairing" not in sp
+        assert "careful senior engineer" not in sp
+        # No AGENTS.md workspace landing.
+        assert "WORKSPACE_AGENTS_MARKER_ZZZ" not in sp
+
+    def test_workspace_boot_keeps_coding_agent(self, tmp_path, monkeypatch):
+        cls, sp = self._boot_and_assemble(tmp_path, monkeypatch, "workspace")
+        assert cls == "workspace"
+        # Default coding-agent boot unchanged.
+        assert "coding agent pairing" in sp or "careful senior engineer" in sp
+        assert "WORKSPACE_AGENTS_MARKER_ZZZ" in sp
+
+
 
