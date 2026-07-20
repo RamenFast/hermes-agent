@@ -1749,6 +1749,16 @@ class HermesACPAgent(acp.Agent):
         final_response = result.get("final_response", "")
         cancelled = bool(state.cancel_event and state.cancel_event.is_set())
         interrupted = bool(result.get("interrupted")) or cancelled
+        # A FAILED turn's final_response is an error report (HTTP 401 revoked-OAuth,
+        # "Unknown Model" after a silent fallback, retry exhaustion...), not
+        # assistant prose. Rendering it as her message is the mute-cause pattern
+        # at the substrate layer: the error wears the resident's face. Route it
+        # as a seam instead — stop_reason "refusal" + the report in _meta — so
+        # clients render an honest error surface, never a fake reply.
+        turn_failed = bool(result.get("failed")) and not interrupted
+        failure_report = final_response if turn_failed else ""
+        if turn_failed:
+            final_response = ""
         # Hermes' local "waiting for model response" interrupt status is metadata,
         # not assistant prose — clients get cancellation from stop_reason instead.
         from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
@@ -1840,8 +1850,19 @@ class HermesACPAgent(acp.Agent):
 
         await self._send_usage_update(state)
 
-        stop_reason = "cancelled" if cancelled else "end_turn"
-        return PromptResponse(stop_reason=stop_reason, usage=usage)
+        if cancelled:
+            stop_reason = "cancelled"
+        elif turn_failed:
+            # The seam, honestly: the turn did not produce assistant prose.
+            stop_reason = "refusal"
+        else:
+            stop_reason = "end_turn"
+        field_meta = None
+        if turn_failed and failure_report:
+            # Carry the report where clients can render a real error surface
+            # (fix-bearing, never wearing the resident's face).
+            field_meta = {"nexus": {"turnError": failure_report[:2000]}}
+        return PromptResponse(stop_reason=stop_reason, usage=usage, field_meta=field_meta)
 
     # ---- Slash commands (headless) -------------------------------------------
 

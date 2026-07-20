@@ -1177,6 +1177,52 @@ class TestPrompt:
         assert final_text in agent_texts
 
     @pytest.mark.asyncio
+    async def test_prompt_failed_turn_is_a_seam_not_prose(self, agent):
+        """A failed turn's error report must never render as assistant prose.
+
+        Provider errors (revoked-OAuth 401, a silent fallback's "Unknown
+        Model" 400, retry exhaustion) come back as ``final_response`` with
+        ``failed: True``. Streaming that text as an agent_message_chunk makes
+        the error wear the assistant's face — the mute-cause pattern at the
+        substrate layer, observed live on nexus-mobile 2026-07-20. The honest
+        shape: stop_reason "refusal" + the report in _meta.nexus.turnError.
+        """
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        report = "HTTP 401: OAuth access token has been revoked."
+
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": report,
+            "messages": [],
+            "completed": False,
+            "failed": True,
+            "error": report,
+        })
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        with patch("agent.title_generator.maybe_auto_title") as mock_title:
+            prompt = [TextContentBlock(type="text", text="hello?")]
+            resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        updates = [
+            call.kwargs.get("update") or call.args[1]
+            for call in mock_conn.session_update.call_args_list
+        ]
+        agent_texts = [
+            update.content.text
+            for update in updates
+            if update.session_update == "agent_message_chunk"
+        ]
+        assert resp.stop_reason == "refusal"
+        assert report not in agent_texts, "error report leaked as assistant prose"
+        assert (resp.field_meta or {}).get("nexus", {}).get("turnError") == report
+        # A failed turn must not be auto-titled as if it were a conversation.
+        mock_title.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_prompt_propagates_hermes_session_id_env(self, agent, monkeypatch):
         """ACP must propagate the originating session id to the agent loop
         via ``HERMES_SESSION_ID`` so tools that want to stamp side-effects
