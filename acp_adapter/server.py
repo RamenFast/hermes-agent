@@ -1611,6 +1611,22 @@ class HermesACPAgent(acp.Agent):
         agent.reasoning_callback = reasoning_cb
         agent.step_callback = step_cb
         agent.stream_delta_callback = stream_delta_cb
+        # Self-improvement review visibility (jot 09:07): the background review's
+        # "💾 Self-improvement review: …" summary previously went only to
+        # _safe_print (stdout — invisible on ACP where stdout is protocol).
+        # Surface it as a session_update so clients can render the honest face.
+        if conn is not None:
+            _review_message_cb = make_message_cb(conn, session_id, loop)
+
+            def _bg_review_to_acp(message: str) -> None:
+                try:
+                    _review_message_cb(f"\n{message}\n")
+                except Exception:
+                    logger.debug("ACP bg-review delivery failed", exc_info=True)
+
+            agent.background_review_callback = _bg_review_to_acp
+        else:
+            agent.background_review_callback = None
 
         # Approval callback is per-thread (thread-local, GHSA-qg5c-hvr5-hjgr).
         # Set it INSIDE _run_agent so the TLS write happens in the executor
