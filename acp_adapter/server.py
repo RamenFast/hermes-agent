@@ -107,6 +107,71 @@ _TEXT_RESOURCE_MIME_TYPES = {
 }
 
 
+def _extract_session_class(kwargs: dict) -> Optional[str]:
+    """Resolve the ACP session register from a handler's ``**kwargs``.
+
+    The ACP ``NewSessionRequest`` / ``LoadSessionRequest`` schemas have no
+    ``class`` field, so the register rides ``_meta`` (the protocol's sanctioned
+    extensibility slot). The acp router flattens a request's ``_meta`` dict into
+    the handler kwargs (``router.py`` does ``params.update(meta)``), so a client
+    that sends::
+
+        {"_meta": {"nexus": {"class": "home"}}}
+
+    reaches ``new_session`` as ``kwargs["nexus"] == {"class": "home"}``. We also
+    accept a flatter ``{"_meta": {"nexus": {"sessionClass": "home"}}}`` and a
+    top-level ``{"_meta": {"class": "home"}}`` for tolerance.
+
+    Returns the normalized class (``"home"`` or ``"workspace"``) when the client
+    sent one, or ``None`` when the request carried no register at all — so
+    callers can distinguish "explicitly workspace" from "unspecified" (load /
+    resume keep the persisted class when it's ``None``; new_session defaults to
+    ``workspace``).
+    """
+    from agent.coding_context import normalize_session_class
+
+    candidate: Any = None
+    nexus = kwargs.get("nexus")
+    if isinstance(nexus, dict):
+        candidate = nexus.get("class") or nexus.get("sessionClass") or nexus.get("session_class")
+    if candidate is None:
+        # Tolerate a top-level flattened form: _meta: {"class": "home"} or
+        # _meta: {"sessionClass": "home"}.
+        candidate = (
+            kwargs.get("class")
+            or kwargs.get("sessionClass")
+            or kwargs.get("session_class")
+        )
+    if not isinstance(candidate, str) or not candidate.strip():
+        return None
+    return normalize_session_class(candidate)
+
+
+def _session_class_meta(session_class: str) -> dict:
+    """Build the ``_meta.nexus`` provenance payload for a session's register.
+
+    Reported back to the ACP client so the phone can render the register mark
+    honestly (home 🍯 vs workspace 🛠). Merged alongside the existing
+    ``_meta.hermes.sessionProvenance`` — never overwrites it.
+    """
+    from agent.coding_context import normalize_session_class
+
+    return {"nexus": {"class": normalize_session_class(session_class)}}
+
+
+def _merge_session_meta(*metas: Optional[dict]) -> Optional[dict]:
+    """Shallow-merge ACP ``_meta`` payloads (later keys win), dropping ``None``.
+
+    Returns ``None`` when nothing was contributed so callers can pass it
+    straight to ``field_meta`` without emitting an empty object.
+    """
+    merged: dict = {}
+    for meta in metas:
+        if isinstance(meta, dict):
+            merged.update(meta)
+    return merged or None
+
+
 def _resource_display_name(uri: str, name: str | None = None, title: str | None = None) -> str:
     """Human-readable attachment name for prompt context."""
     raw_name = (name or "").strip()
@@ -1135,17 +1200,25 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
-        state = self.session_manager.create_session(cwd=cwd)
+        # The ACP register (workspace/home) rides _meta — see
+        # _extract_session_class. Default workspace keeps editors unaffected.
+        session_class = _extract_session_class(kwargs) or "workspace"
+        state = self.session_manager.create_session(cwd=cwd, session_class=session_class)
         await self._register_session_mcp_servers(state, mcp_servers)
-        logger.info("New session %s (cwd=%s)", state.session_id, cwd)
+        logger.info(
+            "New session %s (cwd=%s, class=%s)", state.session_id, cwd, state.session_class
+        )
         self._schedule_available_commands_update(state.session_id)
         self._schedule_usage_update(state)
         return NewSessionResponse(
             session_id=state.session_id,
             models=self._build_model_state(state),
             modes=self._session_modes(state),
-            field_meta=self._provenance_meta(
-                state.session_id, getattr(state.agent, "session_id", state.session_id)
+            field_meta=_merge_session_meta(
+                self._provenance_meta(
+                    state.session_id, getattr(state.agent, "session_id", state.session_id)
+                ),
+                _session_class_meta(state.session_class),
             ),
         )
 
@@ -1160,8 +1233,15 @@ class HermesACPAgent(acp.Agent):
         if state is None:
             logger.warning("load_session: session %s not found", session_id)
             return None
+        # Honor an explicit register request (the phone re-opening a lane as
+        # home, or a lane created before the register existed). Absent → keep
+        # the persisted class. Rebuilding preserves history (see
+        # set_session_class); it's a no-op when the class already matches.
+        requested_class = _extract_session_class(kwargs)
+        if requested_class is not None:
+            state = self.session_manager.set_session_class(session_id, requested_class) or state
         await self._register_session_mcp_servers(state, mcp_servers)
-        logger.info("Loaded session %s", session_id)
+        logger.info("Loaded session %s (class=%s)", session_id, state.session_class)
         # Per ACP spec, `session/load` must stream the prior conversation back
         # to the client via `session/update` notifications BEFORE responding,
         # so the client receives the full transcript within the load request's
@@ -1191,8 +1271,11 @@ class HermesACPAgent(acp.Agent):
         return LoadSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
-            field_meta=self._provenance_meta(
-                session_id, getattr(state.agent, "session_id", session_id)
+            field_meta=_merge_session_meta(
+                self._provenance_meta(
+                    session_id, getattr(state.agent, "session_id", session_id)
+                ),
+                _session_class_meta(state.session_class),
             ),
         )
 
@@ -1206,9 +1289,19 @@ class HermesACPAgent(acp.Agent):
         state = self.session_manager.update_cwd(session_id, cwd)
         if state is None:
             logger.warning("resume_session: session %s not found, creating new", session_id)
-            state = self.session_manager.create_session(cwd=cwd)
+            # A resume that has to create carries whatever register the client
+            # asked for; absent → workspace (back-compat).
+            state = self.session_manager.create_session(
+                cwd=cwd, session_class=_extract_session_class(kwargs) or "workspace"
+            )
+        else:
+            # Honor an explicit register change on resume (same rationale as
+            # load_session). Absent → keep the persisted class.
+            requested_class = _extract_session_class(kwargs)
+            if requested_class is not None:
+                state = self.session_manager.set_session_class(session_id, requested_class) or state
         await self._register_session_mcp_servers(state, mcp_servers)
-        logger.info("Resumed session %s", state.session_id)
+        logger.info("Resumed session %s (class=%s)", state.session_id, state.session_class)
         # See `load_session` above for the spec rationale — replay must
         # complete before the response so clients receive the full transcript
         # within the request's lifetime.
@@ -1226,8 +1319,11 @@ class HermesACPAgent(acp.Agent):
         return ResumeSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
-            field_meta=self._provenance_meta(
-                state.session_id, getattr(state.agent, "session_id", state.session_id)
+            field_meta=_merge_session_meta(
+                self._provenance_meta(
+                    state.session_id, getattr(state.agent, "session_id", state.session_id)
+                ),
+                _session_class_meta(state.session_class),
             ),
         )
 

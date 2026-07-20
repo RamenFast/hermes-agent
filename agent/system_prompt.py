@@ -309,7 +309,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             from agent.coding_context import coding_compact_skill_categories
 
             _compact_cats = coding_compact_skill_categories(
-                platform=agent.platform, cwd=resolve_context_cwd()
+                platform=agent.platform, cwd=resolve_context_cwd(),
+                session_class=getattr(agent, "session_class", None),
             )
         except Exception:
             _compact_cats = frozenset()
@@ -349,6 +350,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # git/workspace snapshot are built once here and cached for the session;
     # the snapshot is never re-probed per turn (that would break the prompt
     # cache), so the brief tells the model to re-check git before relying on it.
+    #
+    # A ``home`` session class (the ACP resident register) forces the general
+    # posture, so coding_system_blocks returns [] — the resident boot carries
+    # her identity (SOUL, above), never the coding-agent operating brief or the
+    # "Landed clean … on <branch>" git preamble. See agent/coding_context.py
+    # §"Session classes".
     if agent.valid_tool_names:
         try:
             from agent.coding_context import coding_system_blocks
@@ -358,6 +365,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                     platform=agent.platform,
                     cwd=resolve_context_cwd(),
                     model=agent.model,
+                    session_class=getattr(agent, "session_class", None),
                 )
             )
         except Exception:

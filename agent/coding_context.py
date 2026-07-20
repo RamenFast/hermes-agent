@@ -67,6 +67,37 @@ logger = logging.getLogger("hermes.coding_context")
 
 CODING_TOOLSET = "coding"
 
+# ── Session classes (the ACP "register") ────────────────────────────────────
+# A session boots in one of two registers. ``workspace`` is the coding-agent
+# boot (operating brief, AGENTS.md workspace landing, git-status snapshot) —
+# right for an editor/repo lane. ``home`` is the resident identity boot: the
+# same posture ``hermes chat`` gives on the PC (SOUL, her voice, skills, rooms)
+# with NONE of the workspace scaffolding. The register is chosen explicitly by
+# the client (the phone always requests ``home``) and is legible, never a
+# silent default deciding who the agent is. See
+# ``JOT-BATCH-3-ADJUDICATED.md`` §"V2-0b · The register mechanism".
+WORKSPACE_SESSION_CLASS = "workspace"
+HOME_SESSION_CLASS = "home"
+DEFAULT_SESSION_CLASS = WORKSPACE_SESSION_CLASS
+
+
+def normalize_session_class(value: Optional[str]) -> str:
+    """Normalize a session-class label to a known class.
+
+    Unknown / absent values fall back to ``workspace`` for back-compat — a
+    session that didn't ask for the home register keeps the coding-agent boot,
+    exactly as it did before the register existed.
+    """
+    raw = str(value or "").strip().lower()
+    if raw == HOME_SESSION_CLASS:
+        return HOME_SESSION_CLASS
+    return WORKSPACE_SESSION_CLASS
+
+
+def is_home_session_class(value: Optional[str]) -> bool:
+    """True when *value* selects the resident ``home`` register."""
+    return normalize_session_class(value) == HOME_SESSION_CLASS
+
 # Surfaces where a coding posture makes sense under ``auto``. Messaging
 # platforms (telegram, discord, slack, …) are intentionally absent — a chat bot
 # in a group is not pair-programming.
@@ -432,12 +463,19 @@ def _marker_root(cwd: Path) -> Optional[Path]:
     return None
 
 
-def _detect_profile_name(mode: str, platform: str, cwd_str: str) -> str:
+def _detect_profile_name(mode: str, platform: str, cwd_str: str, session_class: str = DEFAULT_SESSION_CLASS) -> str:
     """Resolve which profile applies.
 
     ``auto``/``focus``: coding when the surface is interactive AND the cwd is a
     code workspace (a git repo or a recognised project root). ``on``: always
     coding. ``off``: always general.
+
+    The ``home`` session class (the ACP resident register) always resolves to
+    ``general`` — the whole point of the register is that the resident boot
+    carries her identity, not the coding-agent posture, regardless of cwd. It
+    overrides even ``mode == "on"``: an explicit home lane is a deliberate
+    identity choice the workspace force-flag must not silently undo. Editors and
+    the default ACP path keep the ``workspace`` class and the existing behavior.
 
     A git repo rooted at ``$HOME`` (the dotfiles pattern) is NOT a workspace
     signal — without the guard, every session anywhere under a dotfiles-managed
@@ -448,6 +486,8 @@ def _detect_profile_name(mode: str, platform: str, cwd_str: str) -> str:
     risk a stale posture if a long-lived process (gateway/TUI) serves sessions
     from different working directories.
     """
+    if is_home_session_class(session_class):
+        return GENERAL_PROFILE.name
     if mode == "off":
         return GENERAL_PROFILE.name
     if mode == "on":
@@ -575,6 +615,7 @@ def resolve_runtime_mode(
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
     model: Optional[str] = None,
+    session_class: Optional[str] = None,
 ) -> RuntimeMode:
     """Resolve the operating posture once. Cheap — a handful of ``stat`` calls.
 
@@ -584,11 +625,16 @@ def resolve_runtime_mode(
     process can't pin a stale posture; callers resolve once per session and
     hold the result. ``model`` is recorded only to steer edit-format guidance;
     it never affects detection.
+
+    ``session_class`` selects the ACP register: ``home`` forces the resident
+    (``general``) posture regardless of cwd, ``workspace`` (the default) keeps
+    the coding-agent detection. ``None`` is treated as ``workspace``.
     """
     resolved_cwd = _resolve_cwd(cwd)
     mode = _coding_mode(config)
+    resolved_class = normalize_session_class(session_class)
     name = _detect_profile_name(
-        mode, (platform or "").strip().lower(), str(resolved_cwd)
+        mode, (platform or "").strip().lower(), str(resolved_cwd), resolved_class
     )
     return RuntimeMode(
         profile=get_profile(name),
@@ -635,13 +681,17 @@ def coding_system_blocks(
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
     model: Optional[str] = None,
+    session_class: Optional[str] = None,
 ) -> list[str]:
     """Stable system-prompt blocks for the current posture (empty when general).
 
     ``model`` steers the brief's edit-format nudge toward the model's family.
+    ``session_class='home'`` forces the resident register: no coding brief, no
+    git/workspace snapshot (empty list), regardless of cwd.
     """
     return resolve_runtime_mode(
-        platform=platform, cwd=cwd, config=config, model=model
+        platform=platform, cwd=cwd, config=config, model=model,
+        session_class=session_class,
     ).system_blocks()
 
 
@@ -650,6 +700,7 @@ def coding_compact_skill_categories(
     platform: Optional[str] = None,
     cwd: Optional[str | Path] = None,
     config: Optional[dict[str, Any]] = None,
+    session_class: Optional[str] = None,
 ) -> frozenset[str]:
     """Skill categories the active posture demotes to names-only in the index.
 
@@ -657,10 +708,11 @@ def coding_compact_skill_categories(
     the default posture never touches the skill index. Under ``focus``,
     demoted — never hidden: every skill name stays in the index and remains
     loadable via ``skill_view`` / ``skills_list``; only descriptions are
-    dropped.
+    dropped. ``session_class='home'`` forces the general posture, so this is
+    always empty for a home lane.
     """
     return resolve_runtime_mode(
-        platform=platform, cwd=cwd, config=config
+        platform=platform, cwd=cwd, config=config, session_class=session_class
     ).compact_skill_categories()
 
 

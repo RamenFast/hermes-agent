@@ -163,6 +163,14 @@ class SessionState:
     agent: Any  # AIAgent instance
     cwd: str = "."
     model: str = ""
+    # ACP session register: "workspace" (default, coding-agent boot — Zed and
+    # editors) or "home" (the resident identity boot the phone requests — SOUL,
+    # her voice, skills, rooms; no coding brief / AGENTS.md landing / git
+    # preamble). Persisted in the DB (model_config JSON) so it survives a
+    # process restart, and reported back to the ACP client so the lane header
+    # can render the register mark honestly (home 🍯 vs workspace 🛠). See
+    # agent/coding_context.py §"Session classes".
+    session_class: str = "workspace"
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
@@ -196,25 +204,38 @@ class SessionManager:
 
     # ---- public API ---------------------------------------------------------
 
-    def create_session(self, cwd: str = ".") -> SessionState:
-        """Create a new session with a unique ID and a fresh AIAgent."""
+    def create_session(self, cwd: str = ".", session_class: str = "workspace") -> SessionState:
+        """Create a new session with a unique ID and a fresh AIAgent.
+
+        ``session_class`` selects the ACP register: ``workspace`` (default) is
+        the coding-agent boot, ``home`` is the resident identity boot (SOUL +
+        her voice, no workspace scaffolding). See ``_make_agent``.
+        """
         import threading
 
+        from agent.coding_context import normalize_session_class
+
         cwd = _translate_acp_cwd(cwd)
+        session_class = normalize_session_class(session_class)
         session_id = str(uuid.uuid4())
-        agent = self._make_agent(session_id=session_id, cwd=cwd)
+        agent = self._make_agent(
+            session_id=session_id, cwd=cwd, session_class=session_class
+        )
         state = SessionState(
             session_id=session_id,
             agent=agent,
             cwd=cwd,
             model=getattr(agent, "model", "") or "",
+            session_class=session_class,
             cancel_event=threading.Event(),
         )
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
         self._persist(state)
-        logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
+        logger.info(
+            "Created ACP session %s (cwd=%s, class=%s)", session_id, cwd, session_class
+        )
         return state
 
     def get_session(self, session_id: str) -> Optional[SessionState]:
@@ -253,12 +274,14 @@ class SessionManager:
             session_id=new_id,
             cwd=cwd,
             model=original.model or None,
+            session_class=original.session_class,
         )
         state = SessionState(
             session_id=new_id,
             agent=agent,
             cwd=cwd,
             model=getattr(agent, "model", original.model) or original.model,
+            session_class=original.session_class,
             history=copy.deepcopy(original.history),
             cancel_event=threading.Event(),
         )
@@ -354,6 +377,51 @@ class SessionManager:
         self._persist(state)
         return state
 
+    def set_session_class(self, session_id: str, session_class: str) -> Optional[SessionState]:
+        """Change a session's ACP register, rebuilding its agent if needed.
+
+        Used on ``session/load`` / ``session/resume`` when the client explicitly
+        requests a register that differs from the persisted one (e.g. a lane
+        created before the register existed, now re-opened by the phone as
+        ``home``). The conversation history is preserved — only the boot
+        posture (SOUL/identity vs coding-agent scaffolding) is re-selected by
+        minting a fresh agent with the new class and replaying the same history
+        into it. A no-op when the class already matches. Returns the updated
+        state, or ``None`` when the session doesn't exist.
+        """
+        import threading
+
+        from agent.coding_context import normalize_session_class
+
+        session_class = normalize_session_class(session_class)
+        state = self.get_session(session_id)  # checks DB too
+        if state is None:
+            return None
+        if state.session_class == session_class:
+            return state
+
+        # Rebuild the agent under the new register. Reuse the current provider/
+        # model/cwd so only the boot posture changes.
+        agent = self._make_agent(
+            session_id=session_id,
+            cwd=state.cwd,
+            model=state.model or None,
+            session_class=session_class,
+            requested_provider=getattr(state.agent, "provider", None),
+            base_url=getattr(state.agent, "base_url", None),
+            api_mode=getattr(state.agent, "api_mode", None),
+        )
+        state.agent = agent
+        state.session_class = session_class
+        if state.cancel_event is None:
+            state.cancel_event = threading.Event()
+        _register_task_cwd(session_id, state.cwd)
+        self._persist(state)
+        logger.info(
+            "Set ACP session %s register to %s", session_id, session_class
+        )
+        return state
+
     def cleanup(self) -> None:
         """Remove all sessions (memory and database) and clear task-specific cwd overrides."""
         with self._lock:
@@ -422,6 +490,11 @@ class SessionManager:
         # Ensure model is a plain string (not a MagicMock or other proxy).
         model_str = str(state.model) if state.model else None
         session_meta = {"cwd": state.cwd}
+        # Persist the ACP register so a restored session (after process restart)
+        # boots the same way it did originally — home stays home. Only stored
+        # when non-default to keep existing workspace rows byte-identical.
+        if state.session_class and state.session_class != "workspace":
+            session_meta["session_class"] = state.session_class
         provider = getattr(state.agent, "provider", None)
         base_url = getattr(state.agent, "base_url", None)
         api_mode = getattr(state.agent, "api_mode", None)
@@ -441,7 +514,7 @@ class SessionManager:
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
-                    model_config={"cwd": state.cwd},
+                    model_config=session_meta,
                 )
             else:
                 # Update model_config (contains cwd) if changed.
@@ -517,6 +590,7 @@ class SessionManager:
 
         # Extract cwd from model_config.
         cwd = "."
+        session_class = "workspace"
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
@@ -526,11 +600,15 @@ class SessionManager:
                 meta = json.loads(mc)
                 if isinstance(meta, dict):
                     cwd = meta.get("cwd", ".")
+                    session_class = meta.get("session_class") or session_class
                     requested_provider = meta.get("provider") or requested_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
             except (json.JSONDecodeError, TypeError):
                 pass
+
+        from agent.coding_context import normalize_session_class
+        session_class = normalize_session_class(session_class)
 
         model = row.get("model") or None
 
@@ -552,6 +630,7 @@ class SessionManager:
                 session_id=session_id,
                 cwd=cwd,
                 model=model,
+                session_class=session_class,
                 requested_provider=requested_provider,
                 base_url=restored_base_url,
                 api_mode=restored_api_mode,
@@ -565,6 +644,7 @@ class SessionManager:
             agent=agent,
             cwd=cwd,
             model=model or getattr(agent, "model", "") or "",
+            session_class=session_class,
             history=history,
             cancel_event=threading.Event(),
         )
@@ -593,16 +673,28 @@ class SessionManager:
         session_id: str,
         cwd: str,
         model: str | None = None,
+        session_class: str = "workspace",
         requested_provider: str | None = None,
         base_url: str | None = None,
         api_mode: str | None = None,
     ):
         if self._agent_factory is not None:
-            return self._agent_factory()
+            agent = self._agent_factory()
+            # Even a test/stub factory must carry the register so the system
+            # prompt seam and provenance reporting see the right class.
+            try:
+                from agent.coding_context import normalize_session_class
+                agent.session_class = normalize_session_class(session_class)
+            except Exception:
+                agent.session_class = session_class or "workspace"
+            return agent
 
         from run_agent import AIAgent
         from hermes_cli.config import load_config
         from hermes_cli.runtime_provider import resolve_runtime_provider
+        from agent.coding_context import is_home_session_class, normalize_session_class
+
+        session_class = normalize_session_class(session_class)
 
         config = load_config()
         model_cfg = config.get("model")
@@ -632,6 +724,21 @@ class SessionManager:
             "model": model or default_model,
         }
 
+        # ── The register ──────────────────────────────────────────────────
+        # ``home`` reproduces the ``hermes chat`` identity boot over the ACP
+        # transport: SOUL.md is the primary identity (load_soul_identity) and
+        # the workspace scaffolding is dropped (skip_context_files) — no
+        # AGENTS.md landing, and — because the coding posture is gated on the
+        # ``general`` profile which the ``home`` class forces (see
+        # agent/coding_context.py) — no coding operating brief and no
+        # "Landed clean … on <branch>" git-status preamble. The ACP toolset and
+        # transport are untouched: chat IS her ACP session, only the boot
+        # register changes. ``workspace`` (default) keeps today's coding-agent
+        # boot for editors, byte-for-byte.
+        if is_home_session_class(session_class):
+            kwargs["load_soul_identity"] = True
+            kwargs["skip_context_files"] = True
+
         try:
             runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
             kwargs.update(
@@ -649,6 +756,10 @@ class SessionManager:
 
         _register_task_cwd(session_id, cwd)
         agent = AIAgent(**kwargs)
+        # Stamp the resolved register on the agent so the system-prompt seam
+        # (agent/system_prompt.py → coding_system_blocks) forces the general
+        # posture for home lanes, and so provenance reporting can read it back.
+        agent.session_class = session_class
         # Codex app-server sessions are spawned lazily on the first turn. Stamp
         # the ACP workspace onto the agent so the Codex runtime starts from the
         # editor/session cwd instead of the Hermes daemon's process cwd.
