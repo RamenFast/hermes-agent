@@ -502,9 +502,18 @@ class SessionManager:
         # when non-default to keep existing workspace rows byte-identical.
         if state.session_class and state.session_class != "workspace":
             session_meta["session_class"] = state.session_class
-        provider = getattr(state.agent, "provider", None)
-        base_url = getattr(state.agent, "base_url", None)
-        api_mode = getattr(state.agent, "api_mode", None)
+        # Persist the PRIMARY runtime, not the live agent attributes: during a
+        # fallback turn agent.provider/base_url are mutated to the fallback
+        # substrate (e.g. zai), and snapshotting those here would poison the
+        # lane's boot config — every later restore would then pin the primary
+        # model against the fallback's base_url (claude-opus-4-8 → api.z.ai →
+        # 401/400) and the lane wedges even after the primary recovers. This is
+        # exactly what stranded the phone lane on 2026-07-20. The fallback is a
+        # per-turn detour; the lane's durable identity is the primary.
+        _rt = getattr(state.agent, "_primary_runtime", None) or {}
+        provider = _rt.get("provider") or getattr(state.agent, "provider", None)
+        base_url = _rt.get("base_url") or getattr(state.agent, "base_url", None)
+        api_mode = _rt.get("api_mode") or getattr(state.agent, "api_mode", None)
         if isinstance(provider, str) and provider.strip():
             session_meta["provider"] = provider.strip()
         if isinstance(base_url, str) and base_url.strip():
@@ -608,9 +617,22 @@ class SessionManager:
                 if isinstance(meta, dict):
                     cwd = meta.get("cwd", ".")
                     session_class = meta.get("session_class") or session_class
-                    requested_provider = meta.get("provider") or requested_provider
-                    restored_base_url = meta.get("base_url") or restored_base_url
-                    restored_api_mode = meta.get("api_mode") or restored_api_mode
+                    if meta.get("provider"):
+                        # model_config is the lane's durable identity — when it
+                        # names a provider, take base_url/api_mode from it alone
+                        # (absent = provider default). The billing_* columns are
+                        # per-turn accounting and record the FALLBACK substrate
+                        # during a fallback turn; mixing them in here pinned
+                        # claude-opus-4-8 lanes to api.z.ai after an outage
+                        # (2026-07-20) so they 401'd even once the primary
+                        # recovered.
+                        requested_provider = meta.get("provider")
+                        restored_base_url = meta.get("base_url")
+                        restored_api_mode = meta.get("api_mode")
+                    else:
+                        requested_provider = requested_provider
+                        restored_base_url = meta.get("base_url") or restored_base_url
+                        restored_api_mode = meta.get("api_mode") or restored_api_mode
             except (json.JSONDecodeError, TypeError):
                 pass
 
