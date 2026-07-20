@@ -1432,6 +1432,9 @@ class HermesACPAgent(acp.Agent):
                     cwd=s["cwd"],
                     title=s.get("title"),
                     updated_at=updated_at,
+                    # Carry the register so the session picker can render the
+                    # home 🍯 vs workspace 🛠 mark without a per-session load.
+                    field_meta=_session_class_meta(s.get("session_class") or "workspace"),
                 )
             )
 

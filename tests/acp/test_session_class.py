@@ -458,5 +458,46 @@ class TestServerRegisterWiring:
         assert resp.field_meta is not None
         assert resp.field_meta.get("nexus") == {"class": "home"}
 
+    @pytest.mark.asyncio
+    async def test_list_sessions_carries_register(self, acp_agent):
+        # The session picker reads the register off each listed SessionInfo so
+        # it can render the mark without a per-session load.
+        created = await acp_agent.new_session(cwd="/tmp/work", nexus={"class": "home"})
+        sid = created.session_id
+        acp_agent.session_manager.get_session(sid).history.append(
+            {"role": "user", "content": "hi"}
+        )
+        acp_agent.session_manager.save_session(sid)
+        resp = await acp_agent.list_sessions()
+        listed = {s.session_id: s for s in resp.sessions}
+        assert sid in listed
+        assert listed[sid].field_meta == {"nexus": {"class": "home"}}
+
+
+class TestListSessionsRegister:
+    """SessionManager.list_sessions carries the register for both in-memory and
+    DB-restored rows so the picker mark is always available."""
+
+    def test_in_memory_row_carries_class(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        mgr = SessionManager(agent_factory=_stub_agent_factory, db=db)
+        state = mgr.create_session(cwd="/tmp/work", session_class="home")
+        state.history.append({"role": "user", "content": "hi"})
+        infos = mgr.list_sessions()
+        row = next(i for i in infos if i["session_id"] == state.session_id)
+        assert row["session_class"] == "home"
+
+    def test_db_only_row_carries_class(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        mgr1 = SessionManager(agent_factory=_stub_agent_factory, db=db)
+        state = mgr1.create_session(cwd="/tmp/work", session_class="home")
+        state.history.append({"role": "user", "content": "hi"})
+        mgr1.save_session(state.session_id)
+        # A fresh manager lists it from the DB (not in memory).
+        mgr2 = SessionManager(agent_factory=_stub_agent_factory, db=db)
+        infos = mgr2.list_sessions()
+        row = next(i for i in infos if i["session_id"] == state.session_id)
+        assert row["session_class"] == "home"
+
 
 

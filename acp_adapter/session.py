@@ -294,6 +294,8 @@ class SessionManager:
 
     def list_sessions(self, cwd: str | None = None) -> List[Dict[str, Any]]:
         """Return lightweight info dicts for all sessions (memory + database)."""
+        from agent.coding_context import normalize_session_class
+
         normalized_cwd = _normalize_cwd_for_compare(cwd) if cwd else None
         db = self._get_db()
         persisted_rows: dict[str, dict[str, Any]] = {}
@@ -330,6 +332,7 @@ class SessionManager:
                         "cwd": s.cwd,
                         "model": s.model,
                         "history_len": history_len,
+                        "session_class": s.session_class,
                         "title": _build_session_title(persisted.get("title"), preview, s.cwd),
                         "updated_at": _format_updated_at(
                             persisted.get("last_active") or persisted.get("started_at") or time.time()
@@ -344,12 +347,15 @@ class SessionManager:
             message_count = int(row.get("message_count") or 0)
             if message_count <= 0:
                 continue
-            # Extract cwd from model_config JSON.
+            # Extract cwd + register from model_config JSON.
             session_cwd = "."
+            row_session_class = "workspace"
             mc = row.get("model_config")
             if mc:
                 try:
-                    session_cwd = json.loads(mc).get("cwd", ".")
+                    _meta = json.loads(mc)
+                    session_cwd = _meta.get("cwd", ".")
+                    row_session_class = _meta.get("session_class") or row_session_class
                 except (json.JSONDecodeError, TypeError):
                     pass
             if normalized_cwd and _normalize_cwd_for_compare(session_cwd) != normalized_cwd:
@@ -359,6 +365,7 @@ class SessionManager:
                 "cwd": session_cwd,
                 "model": row.get("model") or "",
                 "history_len": message_count,
+                "session_class": normalize_session_class(row_session_class),
                 "title": _build_session_title(row.get("title"), row.get("preview"), session_cwd),
                 "updated_at": _format_updated_at(row.get("last_active") or row.get("started_at")),
             })
