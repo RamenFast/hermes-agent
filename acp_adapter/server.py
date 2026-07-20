@@ -818,6 +818,26 @@ class HermesACPAgent(acp.Agent):
             )
             return None
 
+    def _session_class_meta_for(self, session_id: str) -> Optional[dict]:
+        """``_meta.nexus`` register payload for a live session, or ``None``.
+
+        Reads the class off the in-memory session state (already loaded when we
+        emit updates for it). Best-effort: returns ``None`` rather than forcing a
+        DB restore, so a stray update for an evicted session degrades gracefully
+        to provenance-only.
+        """
+        try:
+            with self.session_manager._lock:
+                state = self.session_manager._sessions.get(session_id)
+            if state is None:
+                return None
+            return _session_class_meta(state.session_class)
+        except Exception:
+            logger.debug(
+                "Could not build ACP session-class meta for %s", session_id, exc_info=True
+            )
+            return None
+
     async def _send_session_info_update(
         self,
         session_id: str,
@@ -847,10 +867,16 @@ class HermesACPAgent(acp.Agent):
         # the updated_at since we're emitting this notification precisely
         # because the title was just refreshed.
         updated_at = datetime.now(timezone.utc).isoformat()
-        meta = self._provenance_meta(
-            session_id,
-            current_hermes_session_id or session_id,
-            previous_hermes_session_id,
+        meta = _merge_session_meta(
+            self._provenance_meta(
+                session_id,
+                current_hermes_session_id or session_id,
+                previous_hermes_session_id,
+            ),
+            # Keep the register visible on every session_info_update so the
+            # client's read of home 🍯 vs workspace 🛠 stays consistent across
+            # the session lifecycle, not just at new/load/resume.
+            self._session_class_meta_for(session_id),
         )
         update = SessionInfoUpdate(
             session_update="session_info_update",

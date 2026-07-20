@@ -396,3 +396,27 @@ class TestServerRegisterWiring:
         if "hermes" in resp.field_meta:
             assert "sessionProvenance" in resp.field_meta["hermes"]
 
+    @pytest.mark.asyncio
+    async def test_session_info_update_carries_register(self, acp_agent):
+        # The register must stay visible on the post-turn session_info_update
+        # notification, not just at new/load/resume — so the client's read of
+        # home vs workspace never goes stale.
+        from unittest.mock import AsyncMock
+
+        created = await acp_agent.new_session(cwd="/tmp/work", nexus={"class": "home"})
+        sid = created.session_id
+
+        conn = AsyncMock()
+        acp_agent._conn = conn
+        await acp_agent._send_session_info_update(sid)
+
+        assert conn.session_update.await_count == 1
+        update = conn.session_update.await_args.kwargs["update"]
+        assert update.field_meta is not None
+        assert update.field_meta.get("nexus") == {"class": "home"}
+
+    def test_session_class_meta_for_unknown_session_is_none(self, acp_agent):
+        # A stray update for an evicted/unknown session degrades gracefully.
+        assert acp_agent._session_class_meta_for("no-such-session") is None
+
+
