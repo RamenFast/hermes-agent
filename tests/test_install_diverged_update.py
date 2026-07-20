@@ -57,7 +57,9 @@ def test_install_ps1_aborts_with_fix_before_reset_for_local_commits() -> None:
     block = _extract_install_ps1_branch_update_block()
 
     assert 'rev-list --reverse "origin/$Branch..refs/heads/$Branch"' in block
-    assert 'show -s --format="  • %h %s"' in block
+    # install.ps1 prints commits with an ASCII asterisk (PowerShell console
+    # encodings mangle the bullet — see d42360ae3); install.sh keeps "•".
+    assert 'show -s --format="  * %h %s"' in block
     assert "fix: git -C" in block
     assert "rebase origin/$Branch" in block
     assert "installer update refused to discard local-only commits" in block

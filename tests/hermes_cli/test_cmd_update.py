@@ -10,7 +10,8 @@ import pytest
 from hermes_cli.main import cmd_update, PROJECT_ROOT
 
 
-def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
+def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0",
+                          local_only_shas=()):
     """Build a side_effect function for subprocess.run that simulates git commands."""
 
     def side_effect(cmd, **kwargs):
@@ -24,6 +25,19 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
         if "rev-parse" in joined and "--verify" in joined:
             rc = 0 if verify_ok else 128
             return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
+
+        # git show-ref --verify refs/heads/{branch}  (local branch exists —
+        # used by the local-only-commit safety scan)
+        if "show-ref" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        # git rev-list --reverse origin/{branch}..refs/heads/{branch}
+        # (the diverged-update safety scan: SHAs of carried local commits,
+        # one per line — NOT a count. Must be matched before the generic
+        # rev-list branch below or "0" leaks in as a fake SHA.)
+        if "rev-list" in joined and "--reverse" in joined:
+            stdout = "".join(f"{sha}\n" for sha in local_only_shas)
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
 
         # git rev-list HEAD..origin/{branch} --count
         if "rev-list" in joined:
@@ -358,15 +372,22 @@ class TestCmdUpdateBranchFallback:
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
 
         # rev-list should use origin/main, not origin/fix/stoicneko
-        rev_list_cmds = [c for c in commands if "rev-list" in c]
+        # Exclude the diverged-update safety scan (rev-list --reverse) — this
+        # asserts on the behind-count rev-list only.
+        rev_list_cmds = [
+            c for c in commands if "rev-list" in c and "--reverse" not in c
+        ]
         assert len(rev_list_cmds) == 1
         assert "origin/main" in rev_list_cmds[0]
         assert "origin/fix/stoicneko" not in rev_list_cmds[0]
 
         # pull should use main, not fix/stoicneko
-        pull_cmds = [c for c in commands if "pull" in c]
-        assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
+        sync_cmds = [
+            c for c in commands
+            if ("merge" in c and "--ff-only" in c) or "pull" in c
+        ]
+        assert len(sync_cmds) == 1
+        assert "main" in sync_cmds[0]
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -381,13 +402,22 @@ class TestCmdUpdateBranchFallback:
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
 
-        rev_list_cmds = [c for c in commands if "rev-list" in c]
+        # Exclude the diverged-update safety scan (rev-list --reverse).
+        rev_list_cmds = [
+            c for c in commands if "rev-list" in c and "--reverse" not in c
+        ]
         assert len(rev_list_cmds) == 1
         assert "origin/main" in rev_list_cmds[0]
 
-        pull_cmds = [c for c in commands if "pull" in c]
-        assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
+        # 124b8f212 replaced `git pull --ff-only` with an explicit
+        # `git merge --ff-only origin/<branch>` (rebase when local commits
+        # are carried) — assert on the sync command, whichever form.
+        sync_cmds = [
+            c for c in commands
+            if ("merge" in c and "--ff-only" in c) or "pull" in c
+        ]
+        assert len(sync_cmds) == 1
+        assert "main" in sync_cmds[0]
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -755,6 +785,11 @@ class TestCmdUpdateBranchFlag:
                 err = f"error: pathspec '{target_branch}' did not match\n" if checkout_fails else ""
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
+            # The diverged-update safety scan expects SHA lines, not a count —
+            # return none so these tests exercise the clean ff-only path.
+            if "rev-list" in joined and "--reverse" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
             if "rev-list" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_count}\n", stderr="")
 
@@ -780,9 +815,12 @@ class TestCmdUpdateBranchFlag:
         assert any("origin/bb/gui" in c for c in rev_list_cmds), rev_list_cmds
         assert not any("origin/main" in c for c in rev_list_cmds), rev_list_cmds
 
-        # pull must target bb/gui
-        pull_cmds = [c for c in commands if "pull" in c and "ff-only" in c]
-        assert any("bb/gui" in c and "main" not in c.split() for c in pull_cmds), pull_cmds
+        # sync must target bb/gui (merge --ff-only since 124b8f212; pull before)
+        sync_cmds = [
+            c for c in commands
+            if "ff-only" in c and ("merge" in c or "pull" in c)
+        ]
+        assert any("bb/gui" in c and "main" not in c.split() for c in sync_cmds), sync_cmds
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
