@@ -1385,6 +1385,12 @@ class HermesACPAgent(acp.Agent):
             session_id=new_id,
             models=self._build_model_state(state) if state is not None else None,
             modes=self._session_modes(state) if state is not None else None,
+            field_meta=_merge_session_meta(
+                self._provenance_meta(
+                    new_id, getattr(state.agent, "session_id", new_id)
+                ),
+                _session_class_meta(state.session_class),
+            ) if state is not None else None,
         )
 
     async def list_sessions(
@@ -1934,6 +1940,7 @@ class HermesACPAgent(acp.Agent):
             session_id=state.session_id,
             cwd=state.cwd,
             model=new_model,
+            session_class=state.session_class,
             requested_provider=target_provider,
         )
         self.session_manager.save_session(state.session_id)
@@ -2179,6 +2186,7 @@ class HermesACPAgent(acp.Agent):
                 session_id=session_id,
                 cwd=state.cwd,
                 model=resolved_model,
+                session_class=state.session_class,
                 requested_provider=requested_provider,
                 base_url=current_base_url,
                 api_mode=current_api_mode,

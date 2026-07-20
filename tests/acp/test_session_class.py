@@ -419,4 +419,44 @@ class TestServerRegisterWiring:
         # A stray update for an evicted/unknown session degrades gracefully.
         assert acp_agent._session_class_meta_for("no-such-session") is None
 
+    @pytest.mark.asyncio
+    async def test_model_switch_preserves_home_register(self, acp_agent):
+        # A model switch rebuilds the agent — the home register must survive,
+        # not silently revert to workspace (set_session_model path).
+        created = await acp_agent.new_session(cwd="/tmp/work", nexus={"class": "home"})
+        sid = created.session_id
+        with patch.object(
+            acp_agent, "_resolve_model_selection", return_value=("openrouter", "some-model")
+        ):
+            await acp_agent.set_session_model(model_id="some-model", session_id=sid)
+        state = acp_agent.session_manager.get_session(sid)
+        assert state.session_class == "home"
+        assert state.agent.session_class == "home"
+
+    @pytest.mark.asyncio
+    async def test_cmd_model_preserves_home_register(self, acp_agent):
+        # The /model slash command rebuilds the agent too — same invariant.
+        created = await acp_agent.new_session(cwd="/tmp/work", nexus={"class": "home"})
+        sid = created.session_id
+        state = acp_agent.session_manager.get_session(sid)
+        with patch.object(
+            acp_agent, "_resolve_model_selection", return_value=("openrouter", "another-model")
+        ):
+            acp_agent._cmd_model("another-model", state)
+        assert state.session_class == "home"
+        assert state.agent.session_class == "home"
+
+    @pytest.mark.asyncio
+    async def test_fork_reports_inherited_home_class(self, acp_agent):
+        created = await acp_agent.new_session(cwd="/tmp/work", nexus={"class": "home"})
+        sid = created.session_id
+        # Fork needs history to copy; give it a turn.
+        acp_agent.session_manager.get_session(sid).history.append(
+            {"role": "user", "content": "hi"}
+        )
+        resp = await acp_agent.fork_session(cwd="/tmp/work", session_id=sid)
+        assert resp.field_meta is not None
+        assert resp.field_meta.get("nexus") == {"class": "home"}
+
+
 
