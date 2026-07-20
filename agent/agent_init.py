@@ -1004,9 +1004,24 @@ def init_agent(
         else:
             # No explicit creds — use the centralized provider router
             from agent.auxiliary_client import resolve_provider_client
-            _routed_client, _ = resolve_provider_client(
+            _routed_client, _routed_model = resolve_provider_client(
                 agent.provider or "auto", model=agent.model, raw_codex=True)
             if _routed_client is not None:
+                # Adopt the router's RESOLVED model. When the requested
+                # provider had no credentials the router may have engaged the
+                # main fallback chain and returned a different backend's
+                # client (e.g. zai/glm-5.2 while agent.model still says
+                # claude-opus-4-8). Discarding the resolved model then sends
+                # the wrong model id to the fallback endpoint → HTTP 400
+                # "Unknown Model" (observed live on the ACP path, 2026-07-20).
+                if _routed_model and _routed_model != agent.model:
+                    logger.info(
+                        "agent_init: provider router resolved model %r (requested %r) — "
+                        "adopting the routed backend's model id",
+                        _routed_model, agent.model,
+                    )
+                    agent.model = _routed_model
+                    agent._fallback_activated = True
                 client_kwargs = {
                     "api_key": _routed_client.api_key,
                     "base_url": str(_routed_client.base_url),

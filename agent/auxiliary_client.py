@@ -4274,6 +4274,20 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
     )
 
 
+def _mark_fallback_resolved(client_obj: Any) -> None:
+    """Stamp a client that was produced by the FALLBACK chain, not the
+    requested provider. ``_resolve_auto`` callers use this to know the
+    resolved model belongs to a *different backend* than the one asked for,
+    so a stale caller-side model id must not override it (the ACP path sent
+    ``claude-opus-4-8`` to the zai fallback → HTTP 400 "Unknown Model",
+    observed live 2026-07-20). Best-effort; some client objects forbid
+    attribute writes."""
+    try:
+        client_obj._hermes_fallback_resolved = True
+    except Exception:
+        pass
+
+
 def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
@@ -4537,10 +4551,12 @@ def _resolve_auto(
         fb_client, fb_model, _fb_label = _try_configured_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
         if fb_client is not None:
+            _mark_fallback_resolved(fb_client)
             return fb_client, fb_model
     fb_client, fb_model, _fb_label = _try_main_fallback_chain(
         task, main_provider or "auto", reason="main provider unavailable")
     if fb_client is not None:
+        _mark_fallback_resolved(fb_client)
         return fb_client, fb_model
 
     # ── Step 3: aggregator / fallback chain ──────────────────────────────
@@ -4715,6 +4731,20 @@ def resolve_provider_client(
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
 
+    # ``native`` is a sentinel, not a real provider: it means "no separate
+    # auxiliary backend — the user's own/native model handles this task"
+    # (companion of ``agent.image_input_mode: native`` and
+    # ``auxiliary.vision.provider: native``). The vision resolver maps
+    # ``native`` to the main provider *before* reaching here, so any call that
+    # arrives with ``native`` is a non-vision probe (tool gating / routing).
+    # Return gracefully at debug level instead of emitting a misleading
+    # "unknown provider 'native'" warning on every harness load.
+    if provider == "native":
+        logger.debug(
+            "resolve_provider_client: 'native' sentinel — deferring to the "
+            "main/native model path (no separate auxiliary client)")
+        return None, None
+
     # Universal model-resolution fallback for concrete providers. ``auto`` is
     # intentionally excluded: `_resolve_auto(main_runtime=...)` returns the
     # model paired with the provider it actually selected. Pre-filling an auto
@@ -4807,6 +4837,18 @@ def resolve_provider_client(
         client, resolved = _resolve_auto(main_runtime=main_runtime, task=task)
         if client is None:
             return None, None
+        # When the FALLBACK chain produced this client, the resolved model is
+        # the fallback backend's own model — the caller's requested model
+        # belongs to the unavailable primary and would 400 on this endpoint
+        # ("Unknown Model": claude-opus-4-8 sent to zai, live 2026-07-20).
+        if getattr(client, "_hermes_fallback_resolved", False) and resolved:
+            if model and model != resolved:
+                logger.info(
+                    "Auto-resolve: fallback backend selected — using its model "
+                    "%r instead of the unavailable primary's %r",
+                    resolved, model,
+                )
+            model = None
         # When auto-detection lands on a non-OpenRouter provider (e.g. a
         # local server), an OpenRouter-formatted model override like
         # "google/gemini-3-flash-preview" won't work.  Drop it and use
@@ -5379,6 +5421,52 @@ def resolve_provider_client(
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
+    elif pconfig.auth_type == "oauth_minimax":
+        # MiniMax OAuth (minimax-oauth) speaks the Anthropic Messages wire —
+        # the same path the main agent uses in agent_init.py. Auxiliary tasks
+        # configured to use MiniMax (e.g. auxiliary.compression.provider:
+        # minimax-oauth, or the ``auto`` chain probing the user's main
+        # provider) must resolve through OAuth here instead of falling to the
+        # "unhandled auth_type" warning and silently dropping to a fallback.
+        #
+        # Build a *per-request* token provider so MiniMax's short-lived
+        # (~15 min) access token is minted fresh on every outbound call and a
+        # refresh persisted by another process (CLI/gateway/cron) is picked up
+        # immediately. ``is_oauth`` stays False: MiniMax is a third-party
+        # Anthropic-compatible endpoint, not native Anthropic, so it must never
+        # trip Claude-Code OAuth identity headers (mirrors the
+        # ``_is_native_anthropic`` gate in agent_init.py — guards #1739).
+        try:
+            from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
+            from agent.anthropic_adapter import build_anthropic_client
+        except ImportError:
+            logger.debug("resolve_provider_client: minimax-oauth dependencies "
+                         "unavailable (anthropic SDK / auth helpers)")
+            return None, None
+        try:
+            creds = resolve_minimax_oauth_runtime_credentials(as_token_provider=True)
+        except Exception as exc:  # noqa: BLE001 — not logged in / refresh failed
+            logger.debug("resolve_provider_client: minimax-oauth unavailable "
+                         "(%s) — run `hermes model` to (re)authenticate", exc)
+            return None, None
+        mm_base_url = (
+            explicit_base_url or creds.get("base_url") or pconfig.inference_base_url
+        ).rstrip("/")
+        final_model = _normalize_resolved_model(model, provider)
+        try:
+            real_client = build_anthropic_client(creds["api_key"], mm_base_url)
+        except Exception as exc:  # noqa: BLE001 — defensive: never block aux tasks
+            logger.warning("resolve_provider_client: failed to build "
+                           "minimax-oauth client: %s", exc)
+            return None, None
+        client = AnthropicAuxiliaryClient(
+            real_client, final_model, api_key="minimax-oauth",
+            base_url=mm_base_url, is_oauth=False,
+        )
+        logger.debug("resolve_provider_client: minimax-oauth (%s)", final_model)
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
+
     elif pconfig.auth_type in {"oauth_device_code", "oauth_external"}:
         # OAuth providers — route through their specific try functions
         if provider == "nous":
@@ -5607,6 +5695,30 @@ def resolve_vision_provider_client(
         if client is None:
             return provider_for_base_override, None, None
         return provider_for_base_override, client, final_model
+
+    if requested == "native":
+        # ``native`` = use the user's own (main) model for vision, and *only*
+        # that model — never silently fall through to a third-party aggregator.
+        # This is the companion of ``agent.image_input_mode: native``: the main
+        # model (e.g. MiniMax-M3 over the Anthropic wire) handles images
+        # directly. Resolve the main provider with ``is_vision=True``; if it
+        # can't be built (not authenticated, etc.) fail closed rather than
+        # leaking vision traffic to an aggregator the user didn't choose.
+        main_provider = _read_main_provider()
+        main_model = _read_main_model()
+        if main_provider and main_provider not in {"auto", "", "native"}:
+            vision_model = _PROVIDER_VISION_MODELS.get(
+                main_provider, resolved_model or main_model)
+            rpc_client, rpc_model = resolve_provider_client(
+                main_provider, vision_model,
+                api_mode=resolved_api_mode, is_vision=True)
+            if rpc_client is not None:
+                logger.info("Vision 'native': using main provider %s (%s)",
+                            main_provider, rpc_model or vision_model)
+                return _finalize(main_provider, rpc_client, rpc_model or vision_model)
+        logger.debug("Vision 'native': main provider %s has no usable vision "
+                     "client", main_provider or "(unset)")
+        return (main_provider or "native"), None, None
 
     if requested == "auto":
         # Vision auto-detection order:
