@@ -1166,6 +1166,41 @@ class CredentialPool:
                         )
                     except Exception as wexc:
                         logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
+                elif entry.source.endswith("hermes_pkce"):
+                    # Same law for our own file: a refresh ROTATES the token
+                    # pair, and ~/.hermes/.anthropic_oauth.json re-seeds the
+                    # pool on every load (_seed_provider_sources upserts by
+                    # source). Without this write-back the stale file wins on
+                    # the next boot, the rotated refresh_token is lost, and
+                    # the next refresh 401s invalid_grant — the credential
+                    # silently dies within one expiry window (~8h). This is
+                    # the overnight-outage shape (2026-07-20 postmortem).
+                    try:
+                        import json as _json
+                        import os as _os
+                        import stat as _stat
+                        from agent.anthropic_adapter import _get_hermes_oauth_file
+                        _of = _get_hermes_oauth_file()
+                        _existing = {}
+                        try:
+                            _existing = _json.loads(_of.read_text(encoding="utf-8"))
+                        except Exception:
+                            pass
+                        _existing.update({
+                            "accessToken": refreshed["access_token"],
+                            "refreshToken": refreshed["refresh_token"],
+                            "expiresAt": refreshed["expires_at_ms"],
+                        })
+                        _tmp = _of.with_suffix(f".tmp.{_os.getpid()}")
+                        _fd = _os.open(str(_tmp), _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC,
+                                       _stat.S_IRUSR | _stat.S_IWUSR)
+                        with _os.fdopen(_fd, "w", encoding="utf-8") as _fh:
+                            _json.dump(_existing, _fh, indent=1)
+                            _fh.flush()
+                            _os.fsync(_fh.fileno())
+                        _os.replace(_tmp, _of)
+                    except Exception as wexc:
+                        logger.debug("Failed to write refreshed token to hermes oauth file: %s", wexc)
             elif self.provider == "openai-codex":
                 # Adopt fresher tokens from auth.json before spending the
                 # refresh_token — single-use tokens consumed by another Hermes
