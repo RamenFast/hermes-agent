@@ -876,7 +876,63 @@ def test_real_update_check_reports_local_only_commit_count(
     hermes_main._cmd_update_check(branch="main")
 
     output = capsys.readouterr().out
-    assert "Local-only: 1 commit on HEAD not in origin/main" in output
+    assert "Local-only: 1 commit on main not in origin/main" in output
+
+
+def test_real_update_check_counts_target_branch_not_current_head(
+    monkeypatch, tmp_path, capsys
+):
+    """--check --branch <b> must count refs/heads/<b>, not the checked-out HEAD.
+
+    Regression: from a side branch carrying extra commits, the carried count
+    for main must still be main's own count (here 1), not the side branch's.
+    """
+    repos = _make_real_update_repo(tmp_path)
+    _commit_file(
+        repos.run,
+        repos.checkout,
+        "local.txt",
+        "local\n",
+        "carried local patch on main",
+    )
+    _git(repos.run, repos.checkout, "checkout", "-b", "side-branch")
+    _commit_file(
+        repos.run,
+        repos.checkout,
+        "side.txt",
+        "side\n",
+        "side branch only commit",
+    )
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", repos.checkout)
+    monkeypatch.setattr(hermes_config, "detect_install_method", lambda root: "git")
+    monkeypatch.setattr(
+        hermes_config, "is_unsupported_install_method", lambda method: False
+    )
+
+    hermes_main._cmd_update_check(branch="main", branch_explicit=True)
+
+    output = capsys.readouterr().out
+    assert "Local-only: 1 commit on main not in origin/main" in output
+
+
+def test_real_update_check_reports_missing_local_branch(
+    monkeypatch, tmp_path, capsys
+):
+    """--check --branch <b> with no local branch <b> must say so, not crash."""
+    repos = _make_real_update_repo(tmp_path)
+    _git(repos.run, repos.upstream, "checkout", "-b", "release")
+    _git(repos.run, repos.upstream, "push", "origin", "release")
+    _git(repos.run, repos.upstream, "checkout", "main")
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", repos.checkout)
+    monkeypatch.setattr(hermes_config, "detect_install_method", lambda root: "git")
+    monkeypatch.setattr(
+        hermes_config, "is_unsupported_install_method", lambda method: False
+    )
+
+    hermes_main._cmd_update_check(branch="release", branch_explicit=True)
+
+    output = capsys.readouterr().out
+    assert "Local-only: no local branch 'release'; nothing carried." in output
 
 
 # ---------------------------------------------------------------------------

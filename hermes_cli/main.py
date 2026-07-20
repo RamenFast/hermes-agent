@@ -8921,8 +8921,11 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     # Report carried commits as a separate dimension from "behind".  The
     # update banner already exposes this fact; the explicit preflight must not
     # hide it, especially because permanent local patches are a supported
-    # setup.  Use origin/<branch> exactly so this agrees with the apply path.
+    # setup.  Count against refs/heads/<branch> — the ref the apply path will
+    # actually update — never HEAD, so ``--check --branch <b>`` reports the
+    # right number even while another branch is checked out.
     origin_branch = f"origin/{branch}"
+    local_branch_ref = f"refs/heads/{branch}"
     origin_is_fresh = (
         not upstream_exists or origin_fetch_result.returncode == 0
     )
@@ -8933,21 +8936,41 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         text=True,
     )
     if origin_is_fresh and origin_verify.returncode == 0:
-        local_result = subprocess.run(
-            git_cmd + ["rev-list", f"{origin_branch}..HEAD", "--count"],
+        local_ref_verify = subprocess.run(
+            git_cmd + ["show-ref", "--verify", "--quiet", local_branch_ref],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
         )
-        if local_result.returncode == 0:
-            local_only = int(local_result.stdout.strip() or "0")
-            commits_word = "commit" if local_only == 1 else "commits"
-            print(
-                f"↻ Local-only: {local_only} {commits_word} on HEAD "
-                f"not in {origin_branch}."
+        if local_ref_verify.returncode == 0:
+            local_result = subprocess.run(
+                git_cmd
+                + ["rev-list", f"{origin_branch}..{local_branch_ref}", "--count"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
             )
+            if local_result.returncode == 0:
+                local_only = int(local_result.stdout.strip() or "0")
+                commits_word = "commit" if local_only == 1 else "commits"
+                print(
+                    f"↻ Local-only: {local_only} {commits_word} on {branch} "
+                    f"not in {origin_branch}."
+                )
+            else:
+                print(
+                    f"⚠ Could not count local-only commits relative to {origin_branch}."
+                )
+        elif local_ref_verify.returncode == 1:
+            # No local branch of that name yet (e.g. checking a branch that has
+            # never been checked out); the update would create it from the
+            # remote, so nothing local can be carried.
+            print(f"↻ Local-only: no local branch '{branch}'; nothing carried.")
         else:
-            print(f"⚠ Could not count local-only commits relative to {origin_branch}.")
+            print(
+                f"⚠ Could not count local-only commits: "
+                f"failed to inspect {local_branch_ref}."
+            )
     elif origin_verify.returncode != 0:
         print(f"⚠ Could not count local-only commits: {origin_branch} is unavailable.")
     else:
