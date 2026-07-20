@@ -262,7 +262,16 @@ def test_workspace_auto_approval_allows_workspace_and_tmp_but_not_sensitive(tmp_
         "workspace_session",
         str(tmp_path),
     )
+    # workspace_session stays conservative: sensitive paths still ask.
     assert not should_auto_approve_edit(
+        EditProposal("write_file", str(env_file), None, "SECRET=x", {}),
+        "workspace_session",
+        str(tmp_path),
+    )
+    # "session" (Don't Ask) is an explicit user assertion of full trust: it
+    # means what it says, sensitive paths included. A silent carve-out that
+    # overrides the user's chosen mode is a boundary silently blocking.
+    assert should_auto_approve_edit(
         EditProposal("write_file", str(env_file), None, "SECRET=x", {}),
         "session",
         str(tmp_path),

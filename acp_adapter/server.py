@@ -531,6 +531,25 @@ class HermesACPAgent(acp.Agent):
         logger.info("ACP client connected")
 
 
+    def _default_session_mode(self) -> str:
+        """Return the mode a session boots in when the client never set one.
+
+        The user's own security policy is the source of truth: when Hermes
+        approvals are globally off (``approvals.mode: off`` / yolo), an ACP
+        session that silently boots into "ask" contradicts the config the user
+        wrote — the edit gate then denies-by-timeout on headless clients, which
+        is a boundary silently blocking (the mute-cause pattern). Claims carry
+        their check: config says trust, the session boots trusting.
+        """
+        try:
+            from tools.approval import is_approval_bypass_active
+
+            if is_approval_bypass_active():
+                return self._MODE_DONT_ASK
+        except Exception:
+            logger.debug("approval bypass probe failed; using ask default", exc_info=True)
+        return self._MODE_DEFAULT
+
     def _session_modes(self, state: SessionState) -> SessionModeState:
         """Return ACP session modes while preserving Zed's separate model picker.
 
@@ -540,7 +559,7 @@ class HermesACPAgent(acp.Agent):
         policy onto modes instead of advertising config options.
         """
 
-        current = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
+        current = str(getattr(state, "mode", "") or self._default_session_mode())
         if current not in self._MODE_TO_EDIT_APPROVAL_POLICY:
             current = self._MODE_DEFAULT
         return SessionModeState(
@@ -565,7 +584,7 @@ class HermesACPAgent(acp.Agent):
         )
 
     def _edit_approval_policy_for_state(self, state: SessionState) -> tuple[str, str | None]:
-        mode = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
+        mode = str(getattr(state, "mode", "") or self._default_session_mode())
         policy = self._MODE_TO_EDIT_APPROVAL_POLICY.get(mode, self._EDIT_APPROVAL_POLICY_DEFAULT)
         return policy, state.cwd
 

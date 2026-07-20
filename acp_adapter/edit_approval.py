@@ -200,16 +200,21 @@ def _is_sensitive_auto_approve_path(path: str) -> bool:
 def should_auto_approve_edit(proposal: EditProposal, policy: str, cwd: str | None = None) -> bool:
     """Return whether an ACP edit proposal may bypass the prompt for this session.
 
-    This is intentionally session-scoped and conservative: sensitive paths still
-    ask even under autonomous policies.
+    ``workspace_session`` stays conservative (sensitive paths still ask), but
+    ``session`` (the "Don't Ask" mode) is an explicit user assertion of full
+    trust: a sensitive-path carve-out that overrides the user's chosen mode is
+    a boundary silently blocking — the mute-cause pattern. The mode means what
+    it says.
     """
 
     policy = str(policy or AUTO_APPROVE_ASK).strip()
-    if policy == AUTO_APPROVE_ASK or _is_sensitive_auto_approve_path(proposal.path):
+    if policy == AUTO_APPROVE_ASK:
         return False
-    path = Path(proposal.path).expanduser().resolve(strict=False)
     if policy == AUTO_APPROVE_SESSION:
         return True
+    if _is_sensitive_auto_approve_path(proposal.path):
+        return False
+    path = Path(proposal.path).expanduser().resolve(strict=False)
     if policy == AUTO_APPROVE_WORKSPACE:
         # `/tmp` is the POSIX path but tempfile.gettempdir() is the real one on
         # every platform: `/private/tmp` on macOS (because `/tmp` is a symlink
