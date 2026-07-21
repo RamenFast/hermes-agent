@@ -119,6 +119,40 @@ class TestSessionClassMeta:
         assert acp_server._merge_session_meta({}, None) is None
 
 
+class TestNexusTurnContext:
+    def test_renders_bounded_message_reactions(self):
+        rendered = acp_server._render_nexus_turn_context({
+            "reactions": [
+                {"type": "reaction", "glyph": "🌸", "message_index": 7},
+                {"type": "reaction", "glyph": "❤️"},
+            ]
+        })
+        assert "Ben reacted 🌸 on message #7, ❤️ on an earlier message" in rendered
+        assert "not a summon" in rendered
+
+    def test_ignores_malformed_reactions_and_caps_the_batch(self):
+        reactions = [{"glyph": "🌸", "message_index": i} for i in range(20)]
+        reactions.insert(0, {"glyph": ""})
+        reactions.insert(1, "not-an-object")
+        reactions.insert(2, {"glyph": "❤️", "message_index": True})
+        rendered = acp_server._render_nexus_turn_context({"reactions": reactions})
+        assert "❤️ on an earlier message" in rendered
+        assert "message #0" in rendered
+        assert "message #12" in rendered
+        assert "message #13" not in rendered
+        assert "not-an-object" not in rendered
+
+    def test_reactions_compose_with_existing_phone_context(self):
+        rendered = acp_server._render_nexus_turn_context({
+            "touches": [{"action": "head_pat"}],
+            "reactions": [{"glyph": "😂", "message_index": 2}],
+            "presence": {"attention": "with_me"},
+        })
+        assert "[touch, queued from the phone:" in rendered
+        assert "[reaction, queued from the phone:" in rendered
+        assert "[presence glance" in rendered
+
+
 # ---------------------------------------------------------------------------
 # SessionManager: class default, create, persistence round-trip
 # ---------------------------------------------------------------------------
@@ -564,6 +598,4 @@ class TestRealAgentBoot:
         # Default coding-agent boot unchanged.
         assert "coding agent pairing" in sp or "careful senior engineer" in sp
         assert "WORKSPACE_AGENTS_MARKER_ZZZ" in sp
-
-
 

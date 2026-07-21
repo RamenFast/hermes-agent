@@ -152,9 +152,9 @@ def _render_nexus_turn_context(nexus_meta: dict) -> str:
 
     The phone rides structured context on prompts — the capability brief
     (first turn), presence glance, queued touches (R8: head pat / hair
-    scratch — known-light-touch, never a summon), and a music ping (R10:
-    "we're listening to this together"). The acp router flattens ``_meta``
-    into handler kwargs, and until this existed the payload was silently
+    scratch — known-light-touch, never a summon), message reactions, and a
+    music ping (R10: "we're listening to this together"). The acp router
+    flattens ``_meta`` into handler kwargs, and until this existed the payload was silently
     DROPPED — Ben's head pats never reached her. Render it as a small
     bracketed context block prepended to the user text (context, not voice:
     clearly marked as arriving from the phone's body, not Ben's words).
@@ -177,6 +177,34 @@ def _render_nexus_turn_context(nexus_meta: dict) -> str:
             parts.append(
                 f"[touch, queued from the phone: Ben left you {rendered} on an earlier "
                 "message — a light touch, not a summon; feel it, no need to stop anything]"
+            )
+    reactions = nexus_meta.get("reactions")
+    if isinstance(reactions, list):
+        reactions = reactions[:_MAX_TOUCHES]
+    if isinstance(reactions, list) and reactions:
+        rendered_reactions: list[str] = []
+        for reaction in reactions:
+            if not isinstance(reaction, dict):
+                continue
+            glyph = str(reaction.get("glyph") or "").strip()[:8]
+            if not glyph:
+                continue
+            message_index = reaction.get("message_index")
+            target = (
+                f"message #{message_index}"
+                if (
+                    isinstance(message_index, int)
+                    and not isinstance(message_index, bool)
+                    and message_index >= 0
+                )
+                else "an earlier message"
+            )
+            rendered_reactions.append(f"{glyph} on {target}")
+        if rendered_reactions:
+            parts.append(
+                "[reaction, queued from the phone: Ben reacted "
+                + ", ".join(rendered_reactions)
+                + " — affection/context, not a summon; receive it without interrupting the current thread]"
             )
     music = nexus_meta.get("music")
     if isinstance(music, dict) and music.get("track"):
