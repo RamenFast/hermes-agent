@@ -147,6 +147,61 @@ def _extract_session_class(kwargs: dict) -> Optional[str]:
     return normalize_session_class(candidate)
 
 
+def _render_nexus_turn_context(nexus_meta: dict) -> str:
+    """Render the phone's ``_meta.nexus`` turn payload into prompt context.
+
+    The phone rides structured context on prompts — the capability brief
+    (first turn), presence glance, queued touches (R8: head pat / hair
+    scratch — known-light-touch, never a summon), and a music ping (R10:
+    "we're listening to this together"). The acp router flattens ``_meta``
+    into handler kwargs, and until this existed the payload was silently
+    DROPPED — Ben's head pats never reached her. Render it as a small
+    bracketed context block prepended to the user text (context, not voice:
+    clearly marked as arriving from the phone's body, not Ben's words).
+    """
+    parts: list[str] = []
+    touches = nexus_meta.get("touches")
+    if isinstance(touches, list) and touches:
+        names = {"head_pat": "a head pat", "hair_scratch": "a hair scratch"}
+        rendered = ", ".join(
+            names.get(str(t.get("action")), str(t.get("action")))
+            for t in touches if isinstance(t, dict) and t.get("action")
+        )
+        if rendered:
+            parts.append(
+                f"[touch, queued from the phone: Ben left you {rendered} on an earlier "
+                "message — a light touch, not a summon; feel it, no need to stop anything]"
+            )
+    music = nexus_meta.get("music")
+    if isinstance(music, dict) and music.get("track"):
+        artist = music.get("artist") or ""
+        album = music.get("album") or ""
+        desc = str(music.get("track"))
+        if artist:
+            desc += f" — {artist}"
+        if album:
+            desc += f" ({album})"
+        parts.append(
+            f"[music ping from the phone: Ben is listening to {desc} right now and "
+            "tapped the share-the-song button — he's sharing the moment with you]"
+        )
+    brief = nexus_meta.get("brief")
+    if isinstance(brief, dict) and brief:
+        try:
+            brief_json = json.dumps(brief, ensure_ascii=False)
+        except Exception:
+            brief_json = str(brief)
+        parts.append(f"[phone capability brief (your body's on-device surfaces): {brief_json}]")
+    presence = nexus_meta.get("presence")
+    if isinstance(presence, dict) and presence:
+        try:
+            presence_json = json.dumps(presence, ensure_ascii=False)
+        except Exception:
+            presence_json = str(presence)
+        parts.append(f"[presence glance (Ben opted in): {presence_json}]")
+    return "\n".join(parts)
+
+
 def _session_class_meta(session_class: str) -> dict:
     """Build the ``_meta.nexus`` provenance payload for a session's register.
 
@@ -1478,6 +1533,16 @@ class HermesACPAgent(acp.Agent):
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
+        # The phone's structured turn context (touches / music / brief / presence)
+        # rides _meta.nexus, which the router flattens into kwargs. Fold it into
+        # the prompt so it actually reaches the agent — see _render_nexus_turn_context.
+        _nexus_kw = kwargs.get("nexus")
+        if isinstance(_nexus_kw, dict):
+            _turn_ctx = _render_nexus_turn_context(_nexus_kw)
+            if _turn_ctx:
+                if isinstance(user_content, str):
+                    user_content = f"{_turn_ctx}\n\n{user_content}" if user_content else _turn_ctx
+                user_text = f"{_turn_ctx}\n\n{user_text}" if user_text else _turn_ctx
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
         has_content = bool(user_text) or (
             isinstance(user_content, list) and bool(user_content)
