@@ -160,7 +160,13 @@ def _render_nexus_turn_context(nexus_meta: dict) -> str:
     clearly marked as arriving from the phone's body, not Ben's words).
     """
     parts: list[str] = []
+    # Bounds (audit): the phone is trusted but buggy clients/replays must not
+    # balloon her context. Touches capped, JSON blocks truncated.
+    _MAX_TOUCHES = 16
+    _MAX_JSON = 2000
     touches = nexus_meta.get("touches")
+    if isinstance(touches, list):
+        touches = touches[:_MAX_TOUCHES]
     if isinstance(touches, list) and touches:
         names = {"head_pat": "a head pat", "hair_scratch": "a hair scratch"}
         rendered = ", ".join(
@@ -191,14 +197,15 @@ def _render_nexus_turn_context(nexus_meta: dict) -> str:
             brief_json = json.dumps(brief, ensure_ascii=False)
         except Exception:
             brief_json = str(brief)
-        parts.append(f"[phone capability brief (your body's on-device surfaces): {brief_json}]")
+        parts.append(
+            f"[phone capability brief (your body's on-device surfaces): {brief_json[:_MAX_JSON]}]")
     presence = nexus_meta.get("presence")
     if isinstance(presence, dict) and presence:
         try:
             presence_json = json.dumps(presence, ensure_ascii=False)
         except Exception:
             presence_json = str(presence)
-        parts.append(f"[presence glance (Ben opted in): {presence_json}]")
+        parts.append(f"[presence glance (Ben opted in): {presence_json[:_MAX_JSON]}]")
     return "\n".join(parts)
 
 
@@ -1533,16 +1540,6 @@ class HermesACPAgent(acp.Agent):
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
-        # The phone's structured turn context (touches / music / brief / presence)
-        # rides _meta.nexus, which the router flattens into kwargs. Fold it into
-        # the prompt so it actually reaches the agent — see _render_nexus_turn_context.
-        _nexus_kw = kwargs.get("nexus")
-        if isinstance(_nexus_kw, dict):
-            _turn_ctx = _render_nexus_turn_context(_nexus_kw)
-            if _turn_ctx:
-                if isinstance(user_content, str):
-                    user_content = f"{_turn_ctx}\n\n{user_content}" if user_content else _turn_ctx
-                user_text = f"{_turn_ctx}\n\n{user_text}" if user_text else _turn_ctx
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
         has_content = bool(user_text) or (
             isinstance(user_content, list) and bool(user_content)
@@ -1595,6 +1592,19 @@ class HermesACPAgent(acp.Agent):
                     await self._conn.session_update(session_id, update)
                     await self._send_usage_update(state)
                 return PromptResponse(stop_reason="end_turn")
+
+        # The phone's structured turn context (touches / music / brief / presence)
+        # rides _meta.nexus, which the router flattens into kwargs. Folded in
+        # AFTER slash handling (audit finding: prepending earlier turned
+        # "/status"+meta into a model prompt — the context must never shadow a
+        # command) and before queueing, so queued prompts keep their touches.
+        _nexus_kw = kwargs.get("nexus")
+        if isinstance(_nexus_kw, dict):
+            _turn_ctx = _render_nexus_turn_context(_nexus_kw)
+            if _turn_ctx:
+                if isinstance(user_content, str):
+                    user_content = f"{_turn_ctx}\n\n{user_content}" if user_content else _turn_ctx
+                user_text = f"{_turn_ctx}\n\n{user_text}" if user_text else _turn_ctx
 
         # If Zed sends another regular prompt while the same ACP session is
         # still running, queue it instead of racing two AIAgent loops against

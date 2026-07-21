@@ -1093,6 +1093,36 @@ class CredentialPool:
         # resolve_codex_runtime_credentials()).  When a waiter finally acquires
         # the lock, the in-lock re-sync below picks up the rotated token the
         # winner persisted and skips the POST.
+        if self.provider == "anthropic":
+            # Anthropic OAuth also rotates the refresh token on every POST.
+            # Gateway + ACP children + CLI share ~/.hermes/.anthropic_oauth.json
+            # and auth.json; an unserialized double-refresh loses the winner's
+            # rotated refresh_token (invalid_grant on the loser's NEXT refresh —
+            # the overnight-outage shape). Serialize through the shared
+            # auth-store flock and, inside the lock, adopt any fresher token a
+            # sibling already persisted instead of spending our own POST.
+            with _auth_store_lock(
+                timeout_seconds=self._single_use_refresh_lock_timeout()
+            ):
+                if entry.source.endswith("hermes_pkce"):
+                    try:
+                        from agent.anthropic_adapter import read_hermes_oauth_credentials
+                        disk = read_hermes_oauth_credentials()
+                    except Exception:
+                        disk = None
+                    if disk and disk.get("accessToken") and (
+                        disk.get("accessToken") != entry.access_token
+                    ):
+                        synced = replace(
+                            entry,
+                            access_token=disk.get("accessToken", ""),
+                            refresh_token=disk.get("refreshToken") or entry.refresh_token,
+                            expires_at_ms=disk.get("expiresAt"),
+                        )
+                        if not force and not self._entry_needs_refresh(synced):
+                            return synced
+                        entry = synced
+                return self._refresh_entry_impl(entry, force=force)
         if self.provider in ("openai-codex", "xai-oauth"):
             sync_entry = (
                 self._sync_codex_entry_from_auth_store
@@ -1191,7 +1221,8 @@ class CredentialPool:
                             "refreshToken": refreshed["refresh_token"],
                             "expiresAt": refreshed["expires_at_ms"],
                         })
-                        _tmp = _of.with_suffix(f".tmp.{_os.getpid()}")
+                        import secrets as _secrets
+                        _tmp = _of.with_suffix(f".tmp.{_os.getpid()}.{_secrets.token_hex(4)}")
                         _fd = _os.open(str(_tmp), _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC,
                                        _stat.S_IRUSR | _stat.S_IWUSR)
                         with _os.fdopen(_fd, "w", encoding="utf-8") as _fh:
