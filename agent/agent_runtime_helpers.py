@@ -841,12 +841,15 @@ def recover_with_credential_pool(
     has_retried_429: bool,
     classified_reason: Optional[FailoverReason] = None,
     error_context: Optional[Dict[str, Any]] = None,
+    force_rotate_rate_limit: bool = False,
 ) -> tuple[bool, bool]:
     """Attempt credential recovery via pool rotation.
 
     Returns (recovered, has_retried_429).
-    On rate limits: first occurrence retries same credential (sets flag True).
-                    second consecutive failure rotates to next credential.
+    On rate limits: first occurrence normally retries the same credential.
+                    ``force_rotate_rate_limit`` skips that wait and rotates now,
+                    for latency-bounded identity surfaces such as the home ACP.
+                    A later consecutive failure also rotates.
     On billing exhaustion: immediately rotates.
     On auth failures: attempts token refresh before rotating.
 
@@ -988,8 +991,17 @@ def recover_with_credential_pool(
                 or "usage limit reached" in context_message
                 or "usage limit has been reached" in context_message
             )
-        if not has_retried_429 and not usage_limit_reached:
+        if (
+            not has_retried_429
+            and not usage_limit_reached
+            and not force_rotate_rate_limit
+        ):
             return False, True
+        if force_rotate_rate_limit and not has_retried_429:
+            _ra().logger.info(
+                "Credential rate limit carries a long wait on an identity-bound surface — "
+                "rotating immediately instead of retrying the same credential"
+            )
         rotate_status = status_code if status_code is not None else 429
         next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
         if next_entry is not None:

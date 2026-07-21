@@ -28,6 +28,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.coding_context import is_home_session_class
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -81,6 +82,42 @@ logger = logging.getLogger(__name__)
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
+
+# A home turn is identity-bound: waiting longer than this for the same
+# credential is worse than rotating an exact-provider credential immediately,
+# and alternate-model fallback is never an honest substitute for the resident.
+_HOME_MAX_PROVIDER_WAIT_SECONDS = 30.0
+
+
+def _home_identity_capacity_policy(
+    agent: Any,
+    reason: FailoverReason,
+    error_context: Optional[Dict[str, Any]],
+) -> tuple[bool, bool]:
+    """Return ``(force_pool_rotation, fail_fast_if_unrecovered)``.
+
+    Ordinary CLI/workspace surfaces keep the general retry/fallback behavior.
+    A ``home`` session instead stays on its exact model lineage. Long provider
+    waits rotate the same provider's credential now; if that cannot recover,
+    the turn terminates through the ACP failure seam rather than sleeping past
+    the client's budget or activating a different model.
+    """
+    if not is_home_session_class(getattr(agent, "session_class", None)):
+        return False, False
+
+    if reason in {FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+        return False, True
+    if reason != FailoverReason.rate_limit:
+        return False, False
+
+    reset_at = (error_context or {}).get("reset_at")
+    try:
+        wait_seconds = max(0.0, float(reset_at) - time.time())
+    except (TypeError, ValueError):
+        return False, False
+    if wait_seconds <= _HOME_MAX_PROVIDER_WAIT_SECONDS:
+        return False, False
+    return True, True
 
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
@@ -2788,14 +2825,32 @@ def run_conversation(
                         )
                         continue
 
+                _home_identity_bound = is_home_session_class(
+                    getattr(agent, "session_class", None)
+                )
+                (
+                    _force_home_pool_rotation,
+                    _home_capacity_fail_fast,
+                ) = _home_identity_capacity_policy(
+                    agent,
+                    classified.reason,
+                    error_context,
+                )
                 recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
                     status_code=status_code,
                     has_retried_429=_retry.has_retried_429,
                     classified_reason=classified.reason,
                     error_context=error_context,
+                    force_rotate_rate_limit=_force_home_pool_rotation,
                 )
                 if recovered_with_pool:
                     continue
+                if _home_capacity_fail_fast:
+                    retry_count = max(retry_count, max_retries)
+                    agent._buffer_status(
+                        "⚠️ Exact home-model capacity is unavailable — refusing "
+                        "alternate lineage and ending this turn honestly."
+                    )
 
                 # Image-too-large recovery: shrink oversized native image
                 # parts in-place and retry once.  Triggered by Anthropic's
@@ -3344,8 +3399,11 @@ def run_conversation(
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
                 _should_fallback = (
-                    is_rate_limited
-                    or (_is_transport_failure and retry_count >= 2)
+                    not _home_identity_bound
+                    and (
+                        is_rate_limited
+                        or (_is_transport_failure and retry_count >= 2)
+                    )
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
@@ -3406,7 +3464,8 @@ def run_conversation(
                 # False and we fall through to the existing terminal handling
                 # + provider-specific troubleshooting guidance unchanged.
                 if (
-                    classified.is_auth
+                    not _home_identity_bound
+                    and classified.is_auth
                     and not _retry.auth_failover_attempted
                     and agent._fallback_index < len(agent._fallback_chain)
                 ):
@@ -4102,8 +4161,14 @@ def run_conversation(
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
                     # per API call block.
-                    if not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
-                        api_error, retry_count=retry_count, max_retries=max_retries,
+                    if (
+                        not _home_capacity_fail_fast
+                        and not _retry.primary_recovery_attempted
+                        and agent._try_recover_primary_transport(
+                            api_error,
+                            retry_count=retry_count,
+                            max_retries=max_retries,
+                        )
                     ):
                         _retry.primary_recovery_attempted = True
                         retry_count = 0
@@ -4115,10 +4180,11 @@ def run_conversation(
                         agent._fallback_index = 0
                         agent._fallback_activated = False
                         continue
-                    # Try fallback before giving up entirely
-                    if agent._has_pending_fallback():
+                    # Try fallback before giving up entirely. Identity-bound
+                    # home sessions deliberately have no alternate-model escape.
+                    if not _home_identity_bound and agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if not _home_identity_bound and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -4129,7 +4195,12 @@ def run_conversation(
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)
                     _billing_guidance = ""
-                    if classified.reason == FailoverReason.billing:
+                    if _home_capacity_fail_fast:
+                        agent._emit_status(
+                            "❌ Exact home-model capacity unavailable; "
+                            f"alternate lineage refused — {_final_summary}"
+                        )
+                    elif classified.reason == FailoverReason.billing:
                         agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")
                         _billing_guidance = _billing_or_entitlement_message(
                             capability="model access",

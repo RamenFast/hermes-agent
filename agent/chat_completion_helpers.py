@@ -28,6 +28,7 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from agent.coding_context import is_home_session_class
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
@@ -1551,6 +1552,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if is_home_session_class(getattr(agent, "session_class", None)):
+        logger.warning(
+            "Fallback refused for identity-bound home session: provider=%s model=%s reason=%s",
+            getattr(agent, "provider", "") or "unknown",
+            getattr(agent, "model", "") or "unknown",
+            getattr(reason, "value", reason) or "unspecified",
+        )
+        return False
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
