@@ -84,6 +84,18 @@ def build_session_provenance(
         if immediate_parent and immediate_parent.get("end_reason") == "compression":
             is_continuation = True
 
+    # Birth provenance belongs to the room lineage, not whichever continuation
+    # currently carries the live head. A CLI-born room can compress while being
+    # reached through ACP; the new continuation must not erase that origin.
+    birth_source = row.get("source")
+    if root_id != current_hermes_session_id:
+        try:
+            root_row = db.get_session(root_id)
+        except Exception:
+            root_row = None
+        if root_row:
+            birth_source = root_row.get("source")
+
     rotated = bool(
         previous_hermes_session_id
         and previous_hermes_session_id != current_hermes_session_id
@@ -94,6 +106,7 @@ def build_session_provenance(
         "currentHermesSessionId": current_hermes_session_id,
         "rootHermesSessionId": root_id,
         "parentHermesSessionId": parent_id,
+        "birthSource": birth_source,
         "sessionKind": "continuation" if is_continuation else "root",
         "compressionDepth": compression_depth,
     }

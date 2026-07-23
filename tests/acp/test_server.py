@@ -358,6 +358,61 @@ class TestSessionOps:
         assert resp is None
 
     @pytest.mark.asyncio
+    async def test_load_session_reaches_exact_cli_room_and_replays_it(self, agent):
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+        db = agent.session_manager._get_db()
+        session_id = "20260723_070047_fbaca1"
+        db.create_session(
+            session_id=session_id,
+            source="cli",
+            model="test-model",
+            model_config={"cwd": "/morning", "session_class": "home"},
+        )
+        db.append_message(session_id, "user", "morning ritual")
+        db.append_message(session_id, "assistant", "room is here")
+
+        resp = await agent.load_session(
+            cwd="/phone",
+            session_id=session_id,
+            _meta={"nexus": {"sessionClass": "home"}},
+        )
+
+        assert isinstance(resp, LoadSessionResponse)
+        state = agent.session_manager.get_session(session_id)
+        assert state is not None
+        assert state.session_id == session_id
+        assert state.source == "cli"
+        assert state.session_class == "home"
+        assert state.cwd == "/phone"
+        assert db.get_session(session_id)["source"] == "cli"
+        replay = [
+            call.kwargs["update"]
+            for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            in {"user_message_chunk", "agent_message_chunk"}
+        ]
+        assert [update.content.text for update in replay] == [
+            "morning ritual",
+            "room is here",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_load_session_refuses_unsupported_birth_source(self, agent):
+        db = agent.session_manager._get_db()
+        db.create_session(
+            session_id="telegram-room",
+            source="telegram",
+            model="test-model",
+        )
+
+        assert await agent.load_session(
+            cwd="/phone",
+            session_id="telegram-room",
+        ) is None
+
+    @pytest.mark.asyncio
     async def test_load_session_replays_persisted_history_to_client(self, agent):
         mock_conn = MagicMock(spec=acp.Client)
         mock_conn.session_update = AsyncMock()

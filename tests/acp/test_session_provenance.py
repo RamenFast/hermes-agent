@@ -30,6 +30,7 @@ def test_root_session_no_compression(db):
     assert prov["currentHermesSessionId"] == "root1"
     assert prov["rootHermesSessionId"] == "root1"
     assert prov["parentHermesSessionId"] is None
+    assert prov["birthSource"] == "acp"
     assert prov["sessionKind"] == "root"
     assert prov["compressionDepth"] == 0
     assert "reason" not in prov  # no rotation signalled
@@ -101,3 +102,20 @@ def test_meta_wrapper_shape(db):
     assert set(meta.keys()) == {"hermes"}
     assert "sessionProvenance" in meta["hermes"]
     assert meta["hermes"]["sessionProvenance"]["currentHermesSessionId"] == "root1"
+
+
+def test_birth_source_is_immutable_provenance(db):
+    db.create_session(session_id="morning", source="cli")
+    db.end_session("morning", "compression")
+    db.create_session(
+        session_id="morning-continuation",
+        source="acp",
+        parent_session_id="morning",
+    )
+
+    prov = build_session_provenance(db, "morning", "morning-continuation")
+
+    assert prov["acpSessionId"] == "morning"
+    assert prov["currentHermesSessionId"] == "morning-continuation"
+    assert prov["rootHermesSessionId"] == "morning"
+    assert prov["birthSource"] == "cli"

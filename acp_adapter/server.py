@@ -1356,7 +1356,14 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> LoadSessionResponse | None:
-        state = self.session_manager.update_cwd(session_id, cwd)
+        # ``session/load`` is the one narrow adoption doorway for a canonical
+        # CLI-born room. The room stays the same durable ID and retains
+        # ``source=cli``; generic restore/fork/discovery remain ACP-only.
+        state = self.session_manager.update_cwd(
+            session_id,
+            cwd,
+            explicit_load=True,
+        )
         if state is None:
             logger.warning("load_session: session %s not found", session_id)
             return None

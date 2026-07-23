@@ -26,6 +26,10 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+_ACP_RESTORE_SOURCES = frozenset({"acp"})
+_EXPLICIT_LOAD_RESTORE_SOURCES = frozenset({"acp", "cli"})
+
+
 def _translate_acp_cwd(cwd: str) -> str:
     """Translate Windows ACP cwd values when Hermes itself is running in WSL.
 
@@ -161,6 +165,9 @@ class SessionState:
 
     session_id: str
     agent: Any  # AIAgent instance
+    # Immutable birth provenance. A CLI-born room may later be reached through
+    # ACP, but that new doorway must never relabel where the room originated.
+    source: str = "acp"
     cwd: str = "."
     model: str = ""
     # ACP session register: "workspace" (default, coding-agent boot — Zed and
@@ -224,6 +231,7 @@ class SessionManager:
         state = SessionState(
             session_id=session_id,
             agent=agent,
+            source="acp",
             cwd=cwd,
             model=getattr(agent, "model", "") or "",
             session_class=session_class,
@@ -249,7 +257,24 @@ class SessionManager:
         if state is not None:
             return state
         # Attempt to restore from database.
-        return self._restore(session_id)
+        return self._restore(session_id, allowed_sources=_ACP_RESTORE_SOURCES)
+
+    def load_session(self, session_id: str) -> Optional[SessionState]:
+        """Load one exact room for an explicit ACP ``session/load`` request.
+
+        Generic ACP discovery, fork, and implicit restoration remain restricted
+        to ACP-born sessions. This narrow doorway additionally admits CLI-born
+        rooms in place, preserving their exact ID, history, and immutable source.
+        Unsupported origins remain closed.
+        """
+        with self._lock:
+            state = self._sessions.get(session_id)
+        if state is not None:
+            return state
+        return self._restore(
+            session_id,
+            allowed_sources=_EXPLICIT_LOAD_RESTORE_SOURCES,
+        )
 
     def remove_session(self, session_id: str) -> bool:
         """Remove a session from memory and database. Returns True if it existed."""
@@ -279,6 +304,7 @@ class SessionManager:
         state = SessionState(
             session_id=new_id,
             agent=agent,
+            source="acp",
             cwd=cwd,
             model=getattr(agent, "model", original.model) or original.model,
             session_class=original.session_class,
@@ -373,10 +399,20 @@ class SessionManager:
         results.sort(key=lambda item: _updated_at_sort_key(item.get("updated_at")), reverse=True)
         return results
 
-    def update_cwd(self, session_id: str, cwd: str) -> Optional[SessionState]:
+    def update_cwd(
+        self,
+        session_id: str,
+        cwd: str,
+        *,
+        explicit_load: bool = False,
+    ) -> Optional[SessionState]:
         """Update the working directory for a session and its tool overrides."""
         cwd = _translate_acp_cwd(cwd)
-        state = self.get_session(session_id)  # checks DB too
+        state = (
+            self.load_session(session_id)
+            if explicit_load
+            else self.get_session(session_id)
+        )
         if state is None:
             return None
         state.cwd = cwd
@@ -528,7 +564,7 @@ class SessionManager:
             if existing is None:
                 db.create_session(
                     session_id=state.session_id,
-                    source="acp",
+                    source=state.source,
                     model=model_str,
                     model_config=session_meta,
                 )
@@ -583,7 +619,12 @@ class SessionManager:
         except Exception:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
 
-    def _restore(self, session_id: str) -> Optional[SessionState]:
+    def _restore(
+        self,
+        session_id: str,
+        *,
+        allowed_sources: frozenset[str] = _ACP_RESTORE_SOURCES,
+    ) -> Optional[SessionState]:
         """Load a session from the database into memory, recreating the AIAgent."""
         import threading
 
@@ -600,8 +641,8 @@ class SessionManager:
         if row is None:
             return None
 
-        # Only restore ACP sessions.
-        if row.get("source") != "acp":
+        source = str(row.get("source") or "")
+        if source not in allowed_sources:
             return None
 
         # Extract cwd from model_config.
@@ -671,6 +712,7 @@ class SessionManager:
         state = SessionState(
             session_id=session_id,
             agent=agent,
+            source=source,
             cwd=cwd,
             model=model or getattr(agent, "model", "") or "",
             session_class=session_class,
@@ -680,7 +722,12 @@ class SessionManager:
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
-        logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
+        logger.info(
+            "Restored %s-born session %s through ACP (%d messages)",
+            source,
+            session_id,
+            len(history),
+        )
         return state
 
     def _delete_persisted(self, session_id: str) -> bool:

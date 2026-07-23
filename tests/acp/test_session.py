@@ -605,6 +605,67 @@ class TestPersistence:
         # Should not be found via ACP SessionManager.
         assert manager.get_session("cli-session-123") is None
 
+    def test_explicit_load_adopts_exact_cli_room_without_relabeling(self, manager):
+        db = manager._get_db()
+        session_id = "20260723_070047_fbaca1"
+        db.create_session(
+            session_id=session_id,
+            source="cli",
+            model="test-model",
+            model_config={"cwd": "/morning", "session_class": "home"},
+        )
+        db.append_message(session_id, "user", "morning room")
+        db.append_message(session_id, "assistant", "same room")
+
+        restored = manager.load_session(session_id)
+
+        assert restored is not None
+        assert restored.session_id == session_id
+        assert restored.source == "cli"
+        assert restored.cwd == "/morning"
+        assert restored.session_class == "home"
+        assert [message["content"] for message in restored.history] == [
+            "morning room",
+            "same room",
+        ]
+
+        restored.history.append({"role": "user", "content": "phone turn"})
+        manager.save_session(session_id)
+        row = db.get_session(session_id)
+        assert row["source"] == "cli"
+        assert row["id"] == session_id
+        assert [
+            message["content"]
+            for message in db.get_messages_as_conversation(session_id)
+        ] == ["morning room", "same room", "phone turn"]
+
+    def test_explicit_load_keeps_unsupported_origins_closed(self, manager):
+        db = manager._get_db()
+        db.create_session(
+            session_id="gateway-room",
+            source="telegram",
+            model="test-model",
+        )
+
+        assert manager.load_session("gateway-room") is None
+
+    def test_update_cwd_only_adopts_cli_room_for_explicit_load(self, manager):
+        db = manager._get_db()
+        db.create_session(
+            session_id="cli-room",
+            source="cli",
+            model="test-model",
+            model_config={"cwd": "/old"},
+        )
+
+        assert manager.update_cwd("cli-room", "/wrong") is None
+        restored = manager.update_cwd("cli-room", "/phone", explicit_load=True)
+
+        assert restored is not None
+        assert restored.source == "cli"
+        assert restored.cwd == "/phone"
+        assert db.get_session("cli-room")["source"] == "cli"
+
     def test_sessions_searchable_via_fts(self, manager):
         """ACP sessions stored in SessionDB are searchable via FTS5."""
         state = manager.create_session()
