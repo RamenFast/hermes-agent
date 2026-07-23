@@ -257,6 +257,51 @@ class TestSessionOps:
         assert "Provider:" in resp.models.available_models[0].description
 
     @pytest.mark.asyncio
+    async def test_home_session_publishes_authenticated_provider_choices(self, monkeypatch):
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(
+                model="claude-opus-4-8",
+                provider="anthropic",
+                base_url=None,
+            )
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+        codex_models = [f"gpt-choice-{index}" for index in range(30)]
+        monkeypatch.setattr(
+            acp_agent,
+            "_load_home_provider_rows",
+            lambda state: (
+                {
+                    "slug": "openai-codex",
+                    "name": "OpenAI Codex",
+                    "models": tuple(codex_models),
+                    "total_models": len(codex_models),
+                },
+                {
+                    "slug": "anthropic",
+                    "name": "Anthropic",
+                    "models": ("claude-fable-5", "claude-opus-4-8"),
+                    "total_models": 2,
+                },
+            ),
+        )
+
+        resp = await acp_agent.new_session(cwd="/tmp", nexus={"class": "home"})
+
+        assert isinstance(resp.models, SessionModelState)
+        assert resp.models.current_model_id == "anthropic:claude-opus-4-8"
+        ids = [choice.model_id for choice in resp.models.available_models]
+        assert ids[0] == "anthropic:claude-opus-4-8"
+        assert "openai-codex:gpt-choice-0" in ids
+        codex = [
+            choice
+            for choice in resp.models.available_models
+            if choice.model_id.startswith("openai-codex:")
+        ]
+        assert len(codex) == acp_agent._HOME_PROVIDER_MODELS_PER_PROVIDER
+        assert "24 of 30 shown" in (codex[0].description or "")
+
+    @pytest.mark.asyncio
     async def test_available_commands_include_help(self, agent):
         help_cmd = next(
             (cmd for cmd in agent._available_commands() if cmd.name == "help"),
@@ -1052,6 +1097,37 @@ class TestSessionConfiguration:
         assert state.agent.provider == "anthropic"
         assert state.agent.base_url == "https://anthropic.example/v1"
         assert runtime_calls[-1] == "anthropic"
+
+    @pytest.mark.asyncio
+    async def test_set_session_model_keeps_old_state_when_agent_build_fails(self):
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(
+                model="old-model",
+                provider="old-provider",
+                base_url="https://old.example/v1",
+                api_mode="chat_completions",
+            )
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = manager.create_session(cwd="/tmp")
+        original_agent = state.agent
+
+        with (
+            patch.object(
+                acp_agent,
+                "_resolve_model_selection",
+                return_value=("new-provider", "new-model"),
+            ),
+            patch.object(manager, "_make_agent", side_effect=RuntimeError("provider failed")),
+        ):
+            with pytest.raises(RuntimeError, match="provider failed"):
+                await acp_agent.set_session_model(
+                    model_id="new-provider:new-model",
+                    session_id=state.session_id,
+                )
+
+        assert state.model == "old-model"
+        assert state.agent is original_agent
 
 
 # ---------------------------------------------------------------------------

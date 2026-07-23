@@ -9,6 +9,8 @@ import contextvars
 import json
 import logging
 import os
+import threading
+import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -677,11 +679,17 @@ class HermesACPAgent(acp.Agent):
     _EDIT_APPROVAL_POLICY_TO_MODE = {
         value: key for key, value in _MODE_TO_EDIT_APPROVAL_POLICY.items()
     }
+    _HOME_PROVIDER_CACHE_TTL_SECONDS = 60.0
+    _HOME_PROVIDER_MODELS_PER_PROVIDER = 24
 
     def __init__(self, session_manager: SessionManager | None = None):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        self._home_provider_cache_lock = threading.Lock()
+        self._home_provider_cache: tuple[
+            tuple[str, str, str], float, tuple[dict[str, Any], ...]
+        ] | None = None
 
     # ---- Connection lifecycle -----------------------------------------------
 
@@ -759,8 +767,8 @@ class HermesACPAgent(acp.Agent):
             return raw_model
         return f"{raw_provider}:{raw_model}"
 
-    def _build_model_state(self, state: SessionState) -> SessionModelState | None:
-        """Return the ACP model selector payload for editors like Zed."""
+    def _build_current_provider_model_state(self, state: SessionState) -> SessionModelState | None:
+        """Return the narrow current-provider selector used by editor sessions."""
         model = str(state.model or getattr(state.agent, "model", "") or "").strip()
         provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
 
@@ -820,6 +828,138 @@ class HermesACPAgent(acp.Agent):
             available_models=[ModelInfo(model_id=fallback_choice, name=model)],
             current_model_id=fallback_choice,
         )
+
+    def _load_home_provider_rows(self, state: SessionState) -> tuple[dict[str, Any], ...]:
+        """Reuse the bounded, authenticated CLI inventory for Nexus's home register."""
+        model = str(state.model or getattr(state.agent, "model", "") or "").strip()
+        provider = str(
+            getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
+        ).strip()
+        base_url = str(getattr(state.agent, "base_url", None) or "").strip()
+        cache_key = (provider.lower(), model, base_url.rstrip("/"))
+        now = time.monotonic()
+
+        with self._home_provider_cache_lock:
+            cached = self._home_provider_cache
+            if (
+                cached is not None
+                and cached[0] == cache_key
+                and now - cached[1] < self._HOME_PROVIDER_CACHE_TTL_SECONDS
+            ):
+                return cached[2]
+
+        from hermes_cli.inventory import build_models_payload, load_picker_context
+
+        context = load_picker_context().with_overrides(
+            current_provider=provider,
+            current_model=model,
+            current_base_url=base_url,
+        )
+        payload = build_models_payload(
+            context,
+            explicit_only=True,
+            probe_custom_providers=False,
+            probe_current_custom_provider=False,
+            max_models=self._HOME_PROVIDER_MODELS_PER_PROVIDER,
+        )
+        safe_rows: list[dict[str, Any]] = []
+        for raw in payload.get("providers") or []:
+            if not isinstance(raw, dict):
+                continue
+            slug = str(raw.get("slug") or "").strip().lower()
+            if not slug:
+                continue
+            models = tuple(
+                str(item).strip()
+                for item in (raw.get("models") or [])
+                if str(item).strip()
+            )
+            try:
+                total_models = max(int(raw.get("total_models") or 0), len(models))
+            except (TypeError, ValueError):
+                total_models = len(models)
+            safe_rows.append({
+                "slug": slug,
+                "name": str(raw.get("name") or slug).strip() or slug,
+                "models": models,
+                "total_models": total_models,
+            })
+
+        rows = tuple(safe_rows)
+        with self._home_provider_cache_lock:
+            self._home_provider_cache = (cache_key, time.monotonic(), rows)
+        return rows
+
+    def _build_home_model_state(self, state: SessionState) -> SessionModelState | None:
+        """Return provider-prefixed choices for the Nexus Mobile home picker."""
+        model = str(state.model or getattr(state.agent, "model", "") or "").strip()
+        provider = str(
+            getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
+        ).strip()
+
+        try:
+            from hermes_cli.models import normalize_provider, provider_label
+
+            current_provider = normalize_provider(provider)
+            rows = list(self._load_home_provider_rows(state))
+            rows.sort(key=lambda row: str(row.get("slug") or "") != current_provider)
+            available_models: list[ModelInfo] = []
+            seen_ids: set[str] = set()
+
+            for row in rows:
+                row_provider = normalize_provider(str(row.get("slug") or ""))
+                if not row_provider:
+                    continue
+                row_models = list(row.get("models") or [])
+                if row_provider == current_provider and model:
+                    row_models = [model] + [item for item in row_models if item != model]
+                shown_models = row_models[: self._HOME_PROVIDER_MODELS_PER_PROVIDER]
+                total_models = max(int(row.get("total_models") or 0), len(row_models))
+                provider_name = str(row.get("name") or provider_label(row_provider)).strip()
+                if total_models > len(shown_models):
+                    provider_name = f"{provider_name} ({len(shown_models)} of {total_models} shown)"
+
+                for rendered_model in shown_models:
+                    choice_id = self._encode_model_choice(row_provider, rendered_model)
+                    if not choice_id or choice_id in seen_ids:
+                        continue
+                    desc_parts = [f"Provider: {provider_name}"]
+                    if row_provider == current_provider and rendered_model == model:
+                        desc_parts.append("current")
+                    available_models.append(
+                        ModelInfo(
+                            model_id=choice_id,
+                            name=rendered_model,
+                            description=" • ".join(desc_parts),
+                        )
+                    )
+                    seen_ids.add(choice_id)
+
+            current_model_id = self._encode_model_choice(current_provider, model)
+            if current_model_id and current_model_id not in seen_ids:
+                available_models.insert(
+                    0,
+                    ModelInfo(
+                        model_id=current_model_id,
+                        name=model,
+                        description=f"Provider: {provider_label(current_provider)} • current",
+                    ),
+                )
+            if available_models:
+                return SessionModelState(
+                    available_models=available_models,
+                    current_model_id=current_model_id or available_models[0].model_id,
+                )
+        except Exception:
+            logger.debug("Could not build home ACP provider/model state", exc_info=True)
+
+        return self._build_current_provider_model_state(state)
+
+    async def _build_model_state(self, state: SessionState) -> SessionModelState | None:
+        """Build model state without blocking ACP's event loop on provider discovery."""
+        if str(getattr(state, "session_class", "") or "") != "home":
+            return self._build_current_provider_model_state(state)
+        return await asyncio.to_thread(self._build_home_model_state, state)
 
     @staticmethod
     def _resolve_model_selection(raw_model: str, current_provider: str) -> tuple[str, str]:
@@ -1339,7 +1479,7 @@ class HermesACPAgent(acp.Agent):
         )
         return NewSessionResponse(
             session_id=state.session_id,
-            models=self._build_model_state(state),
+            models=await self._build_model_state(state),
             modes=self._session_modes(state),
             field_meta=_merge_session_meta(
                 self._provenance_meta(
@@ -1407,7 +1547,7 @@ class HermesACPAgent(acp.Agent):
             self._send_session_info_update(session_id)
         )
         return LoadSessionResponse(
-            models=self._build_model_state(state),
+            models=await self._build_model_state(state),
             modes=self._session_modes(state),
             field_meta=_merge_session_meta(
                 self._provenance_meta(
@@ -1455,7 +1595,7 @@ class HermesACPAgent(acp.Agent):
         self._schedule_available_commands_update(state.session_id)
         self._schedule_usage_update(state)
         return ResumeSessionResponse(
-            models=self._build_model_state(state),
+            models=await self._build_model_state(state),
             modes=self._session_modes(state),
             field_meta=_merge_session_meta(
                 self._provenance_meta(
@@ -1495,7 +1635,7 @@ class HermesACPAgent(acp.Agent):
             self._schedule_available_commands_update(new_id)
         return ForkSessionResponse(
             session_id=new_id,
-            models=self._build_model_state(state) if state is not None else None,
+            models=await self._build_model_state(state) if state is not None else None,
             modes=self._session_modes(state) if state is not None else None,
             field_meta=_merge_session_meta(
                 self._provenance_meta(
@@ -2377,11 +2517,10 @@ class HermesACPAgent(acp.Agent):
                 model_id,
                 current_provider or "openrouter",
             )
-            state.model = resolved_model
             provider_changed = bool(current_provider and requested_provider != current_provider)
             current_base_url = None if provider_changed else getattr(state.agent, "base_url", None)
             current_api_mode = None if provider_changed else getattr(state.agent, "api_mode", None)
-            state.agent = self.session_manager._make_agent(
+            replacement_agent = self.session_manager._make_agent(
                 session_id=session_id,
                 cwd=state.cwd,
                 model=resolved_model,
@@ -2390,6 +2529,8 @@ class HermesACPAgent(acp.Agent):
                 base_url=current_base_url,
                 api_mode=current_api_mode,
             )
+            state.model = resolved_model
+            state.agent = replacement_agent
             self.session_manager.save_session(session_id)
             logger.info(
                 "Session %s: model switched to %s via provider %s",
