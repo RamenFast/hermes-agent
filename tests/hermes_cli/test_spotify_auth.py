@@ -8,6 +8,40 @@ from hermes_cli import auth as auth_mod
 from hermes_cli.auth import AuthError, resolve_spotify_runtime_credentials
 
 
+def test_default_spotify_scope_covers_every_shipped_read_and_write_surface() -> None:
+    assert set(auth_mod.DEFAULT_SPOTIFY_SCOPE.split()) == {
+        "user-modify-playback-state",
+        "user-read-playback-state",
+        "user-read-currently-playing",
+        "user-read-recently-played",
+        "user-top-read",
+        "playlist-read-private",
+        "playlist-read-collaborative",
+        "playlist-modify-public",
+        "playlist-modify-private",
+        "user-library-read",
+        "user-library-modify",
+    }
+
+
+def test_spotify_reauthorization_upgrades_stale_scope_and_preserves_custom_scope() -> None:
+    scope = auth_mod._spotify_login_scope(
+        explicit_scope=None,
+        stored_scope="user-read-currently-playing custom-existing-scope",
+    ).split()
+
+    assert "user-top-read" in scope
+    assert "custom-existing-scope" in scope
+    assert len(scope) == len(set(scope))
+
+
+def test_explicit_spotify_scope_remains_an_exact_expert_override() -> None:
+    assert auth_mod._spotify_login_scope(
+        explicit_scope="user-read-currently-playing",
+        stored_scope="user-top-read",
+    ) == "user-read-currently-playing"
+
+
 def test_store_provider_state_can_skip_active_provider() -> None:
     auth_store = {"active_provider": "nous", "providers": {}}
 

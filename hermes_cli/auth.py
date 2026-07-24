@@ -129,18 +129,20 @@ SPOTIFY_DASHBOARD_URL = "https://developer.spotify.com/dashboard"
 SPOTIFY_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 
 OAUTH_OVER_SSH_DOCS_URL = "https://hermes-agent.nousresearch.com/docs/guides/oauth-over-ssh"
-DEFAULT_SPOTIFY_SCOPE = " ".join((
+SPOTIFY_SHIPPED_SCOPES = (
     "user-modify-playback-state",
     "user-read-playback-state",
     "user-read-currently-playing",
     "user-read-recently-played",
+    "user-top-read",
     "playlist-read-private",
     "playlist-read-collaborative",
     "playlist-modify-public",
     "playlist-modify-private",
     "user-library-read",
     "user-library-modify",
-))
+)
+DEFAULT_SPOTIFY_SCOPE = " ".join(SPOTIFY_SHIPPED_SCOPES)
 SERVICE_PROVIDER_NAMES: Dict[str, str] = {
     "spotify": "Spotify",
 }
@@ -2534,6 +2536,21 @@ def _spotify_scope_string(raw_scope: Optional[str] = None) -> str:
     return " ".join(_spotify_scope_list(raw_scope))
 
 
+def _spotify_login_scope(
+    explicit_scope: Optional[str],
+    stored_scope: Optional[str],
+) -> str:
+    """Resolve login scope without pinning reauthorization to an obsolete token contract.
+
+    An explicit ``--scope`` remains an exact expert override. Ordinary login preserves any
+    previously requested custom scopes and appends every scope required by the current shipped
+    Spotify surface, allowing releases to add a permission such as ``user-top-read`` safely.
+    """
+    if explicit_scope:
+        return _spotify_scope_string(explicit_scope)
+    return _spotify_scope_string(f"{stored_scope or ''} {DEFAULT_SPOTIFY_SCOPE}")
+
+
 def _spotify_client_id(
     explicit: Optional[str] = None,
     state: Optional[Dict[str, Any]] = None,
@@ -3063,7 +3080,10 @@ def login_spotify_command(args) -> None:
         )
 
     redirect_uri = _spotify_redirect_uri(getattr(args, "redirect_uri", None), existing_state)
-    scope = _spotify_scope_string(getattr(args, "scope", None) or existing_state.get("scope"))
+    scope = _spotify_login_scope(
+        getattr(args, "scope", None),
+        existing_state.get("scope"),
+    )
     accounts_base_url = _spotify_accounts_base_url(existing_state)
     api_base_url = _spotify_api_base_url(existing_state)
     open_browser = not getattr(args, "no_browser", False)
