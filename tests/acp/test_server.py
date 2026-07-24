@@ -36,7 +36,7 @@ from acp.schema import (
     UserMessageChunk,
 )
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID
-from acp_adapter.server import HermesACPAgent, HERMES_VERSION
+from acp_adapter.server import HermesACPAgent, HERMES_VERSION, _parse_nexus_tempo
 from acp_adapter.session import SessionManager
 from hermes_state import SessionDB
 
@@ -1181,6 +1181,116 @@ class TestPrompt:
         assert state.agent.stream_delta_callback is not None
         assert state.agent.reasoning_callback is not None
         assert state.agent.thinking_callback is None
+
+    @pytest.mark.asyncio
+    async def test_phone_tempo_applies_for_exactly_one_turn_and_restores_prior(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        prior = {"enabled": True, "effort": "medium"}
+        state.agent.reasoning_config = prior
+        observed = {}
+
+        def mock_run(*args, **kwargs):
+            observed["during"] = dict(state.agent.reasoning_config)
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = mock_run
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        response = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="take the careful path")],
+            session_id=new_resp.session_id,
+            nexus={
+                "tempo": {
+                    "receipt_id": "tempo-733",
+                    "level": "high",
+                    "author": "nexus",
+                    "reason": "the decision has several coupled invariants",
+                    "scope": "next_turn",
+                    "ttl_turns": 1,
+                }
+            },
+        )
+
+        assert observed["during"] == {"enabled": True, "effort": "high"}
+        assert state.agent.reasoning_config is prior
+        receipt = (response.field_meta or {})["nexus"]["tempo"]
+        assert receipt["receipt_id"] == "tempo-733"
+        assert receipt["render_state"] == "applied"
+        assert receipt["prior_restored"] is True
+        assert receipt["turn_terminal"] == "end_turn"
+
+    @pytest.mark.asyncio
+    async def test_invalid_phone_tempo_falls_back_without_mutating_runtime(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        prior = {"enabled": True, "effort": "low"}
+        state.agent.reasoning_config = prior
+        observed = {}
+
+        def mock_run(*args, **kwargs):
+            observed["during"] = state.agent.reasoning_config
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = mock_run
+        response = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="hello")],
+            session_id=new_resp.session_id,
+            nexus={
+                "tempo": {
+                    "receipt_id": "tempo-bad",
+                    "level": "high",
+                    "author": "nexus",
+                    "reason": "machine says Ben is sad",
+                    "scope": "next_turn",
+                    "ttl_turns": 1,
+                    "emotion": "sad",
+                }
+            },
+        )
+
+        assert observed["during"] is prior
+        assert state.agent.reasoning_config is prior
+        receipt = (response.field_meta or {})["nexus"]["tempo"]
+        assert receipt["render_state"] == "failed"
+        assert "unsupported fields" in receipt["error"]
+        assert receipt["fix"]
+
+
+    def test_phone_tempo_parser_requires_explicit_author_reason_and_one_turn_scope(self):
+        config, receipt = _parse_nexus_tempo(
+            {
+                "tempo": {
+                    "receipt_id": "r1",
+                    "level": "minimal",
+                    "author": "ben",
+                    "reason": "quick factual exchange",
+                    "scope": "next_turn",
+                    "ttl_turns": 1,
+                }
+            }
+        )
+
+        assert config == {"enabled": True, "effort": "minimal"}
+        assert receipt["render_state"] == "validated"
+
+        config, receipt = _parse_nexus_tempo(
+            {
+                "tempo": {
+                    "receipt_id": "r2",
+                    "level": "medium",
+                    "author": "machine",
+                    "reason": "classified emotion",
+                    "scope": "sticky",
+                    "ttl_turns": 99,
+                }
+            }
+        )
+        assert config is None
+        assert receipt["render_state"] == "failed"
+        assert receipt["fix"]
 
     @pytest.mark.asyncio
     async def test_prompt_updates_history(self, agent):

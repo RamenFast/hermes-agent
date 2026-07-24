@@ -108,6 +108,90 @@ _TEXT_RESOURCE_MIME_TYPES = {
     "application/sql",
 }
 
+_NEXUS_TEMPO_LEVELS = {"minimal", "low", "medium", "high"}
+_NEXUS_TEMPO_AUTHORS = {"ben", "nexus"}
+_NEXUS_TEMPO_FIELDS = {
+    "receipt_id",
+    "level",
+    "author",
+    "reason",
+    "scope",
+    "ttl_turns",
+}
+
+
+def _parse_nexus_tempo(nexus_meta: dict) -> tuple[dict | None, dict | None]:
+    """Validate Nexus Mobile's explicit one-turn reasoning request.
+
+    This is operational conditioning, not affect inference. The phone must name a
+    closed effort level, an author, and an operational reason. Unknown fields are
+    refused so an emotion/sentiment payload cannot quietly grow onto this wire.
+    The returned receipt is safe to reflect in ``_meta.nexus.tempo``.
+    """
+    raw = nexus_meta.get("tempo")
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        return None, {
+            "schema": "dev.nexus.tempo.backend-receipt.v1",
+            "receipt_id": "unknown",
+            "render_state": "failed",
+            "error": "tempo must be an object",
+            "fix": "send receipt_id, level, author, reason, scope=next_turn, and ttl_turns=1",
+        }
+
+    receipt_id = str(raw.get("receipt_id") or "").strip()[:128]
+    level = str(raw.get("level") or "").strip().lower()
+    author = str(raw.get("author") or "").strip().lower()
+    reason = str(raw.get("reason") or "").strip()
+    scope = str(raw.get("scope") or "").strip().lower()
+    ttl_turns = raw.get("ttl_turns")
+    unknown = sorted(set(raw) - _NEXUS_TEMPO_FIELDS)
+
+    base = {
+        "schema": "dev.nexus.tempo.backend-receipt.v1",
+        "receipt_id": receipt_id or "unknown",
+        "level": level or None,
+        "author": author or None,
+        "reason": reason[:240] or None,
+        "scope": scope or None,
+        "ttl_turns": ttl_turns,
+    }
+
+    failure: tuple[str, str] | None = None
+    if unknown:
+        failure = (
+            f"tempo contains unsupported fields: {', '.join(unknown)}",
+            "remove every field except receipt_id, level, author, reason, scope, and ttl_turns",
+        )
+    elif not receipt_id:
+        failure = ("tempo receipt_id is required", "generate a stable receipt id on the phone")
+    elif level not in _NEXUS_TEMPO_LEVELS:
+        failure = (
+            f"unsupported tempo level: {level or 'missing'}",
+            "use minimal, low, medium, or high",
+        )
+    elif author not in _NEXUS_TEMPO_AUTHORS:
+        failure = ("tempo author must be ben or nexus", "name the human or resident author explicitly")
+    elif not reason:
+        failure = ("tempo operational reason is required", "name why this effort level serves the turn")
+    elif len(reason) > 240:
+        failure = ("tempo operational reason is too long", "keep the reason at or below 240 characters")
+    elif scope != "next_turn" or ttl_turns != 1:
+        failure = (
+            "this Tempo experiment only supports one-turn scope",
+            "send scope=next_turn and ttl_turns=1",
+        )
+
+    if failure is not None:
+        error, fix = failure
+        return None, {**base, "render_state": "failed", "error": error, "fix": fix}
+
+    return (
+        {"enabled": True, "effort": level},
+        {**base, "render_state": "validated", "error": None, "fix": None},
+    )
+
 
 def _extract_session_class(kwargs: dict) -> Optional[str]:
     """Resolve the ACP session register from a handler's ``**kwargs``.
@@ -236,6 +320,14 @@ def _render_nexus_turn_context(nexus_meta: dict) -> str:
         except Exception:
             presence_json = str(presence)
         parts.append(f"[presence glance (Ben opted in): {presence_json[:_MAX_JSON]}]")
+    tempo_config, tempo_receipt = _parse_nexus_tempo(nexus_meta)
+    if tempo_config is not None and tempo_receipt is not None:
+        parts.append(
+            "[tempo authored from the phone: reasoning effort="
+            f"{tempo_receipt['level']}; author={tempo_receipt['author']}; "
+            f"operational reason={tempo_receipt['reason']} — this is explicit one-turn "
+            "conditioning, not a reading of anyone's feelings]"
+        )
     return "\n".join(parts)
 
 
@@ -1774,7 +1866,10 @@ class HermesACPAgent(acp.Agent):
         # "/status"+meta into a model prompt — the context must never shadow a
         # command) and before queueing, so queued prompts keep their touches.
         _nexus_kw = kwargs.get("nexus")
+        tempo_config: dict | None = None
+        tempo_receipt: dict | None = None
         if isinstance(_nexus_kw, dict):
+            tempo_config, tempo_receipt = _parse_nexus_tempo(_nexus_kw)
             _turn_ctx = _render_nexus_turn_context(_nexus_kw)
             if _turn_ctx:
                 if isinstance(user_content, str):
@@ -1853,6 +1948,8 @@ class HermesACPAgent(acp.Agent):
             approval_cb = None
 
         agent = state.agent
+        tempo_applied = False
+        tempo_prior_restored = False
         agent.tool_progress_callback = tool_progress_cb
         # ACP thought panes should not receive Hermes' local kawaii waiting/status
         # updates. Route provider/model reasoning deltas instead; if the provider
@@ -1898,6 +1995,8 @@ class HermesACPAgent(acp.Agent):
 
         def _run_agent() -> dict:
             nonlocal previous_approval_cb, interactive_token, edit_approval_token, previous_session_id
+            nonlocal tempo_applied, tempo_prior_restored
+            prior_reasoning_config = getattr(agent, "reasoning_config", None)
             # Bind HERMES_SESSION_KEY for this session so per-session caches
             # (e.g. the interactive sudo password cache in tools.terminal_tool)
             # scope to the ACP session rather than leaking across sessions
@@ -1941,6 +2040,9 @@ class HermesACPAgent(acp.Agent):
             previous_session_id = os.environ.get("HERMES_SESSION_ID")
             os.environ["HERMES_SESSION_ID"] = session_id
             try:
+                if tempo_config is not None:
+                    agent.reasoning_config = dict(tempo_config)
+                    tempo_applied = True
                 result = agent.run_conversation(
                     user_message=user_content,
                     conversation_history=state.history,
@@ -1952,6 +2054,9 @@ class HermesACPAgent(acp.Agent):
                 logger.exception("Agent error in session %s", session_id)
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
+                if tempo_config is not None:
+                    agent.reasoning_config = prior_reasoning_config
+                    tempo_prior_restored = True
                 # Restore the interactive contextvar for this context.
                 if interactive_token is not None:
                     reset_hermes_interactive_context(interactive_token)
@@ -2155,6 +2260,23 @@ class HermesACPAgent(acp.Agent):
             # Carry the report where clients can render a real error surface
             # (fix-bearing, never wearing the resident's face).
             nexus_meta["turnError"] = failure_report[:2000]
+        if tempo_receipt is not None:
+            rendered_tempo = dict(tempo_receipt)
+            if tempo_applied:
+                rendered_tempo.update(
+                    {
+                        "render_state": "applied",
+                        "applied_at": datetime.now(timezone.utc).isoformat(),
+                        "prior_restored": tempo_prior_restored,
+                        "provider": str(turn_provider) if turn_provider else None,
+                        "model": str(turn_model) if turn_model else None,
+                        "turn_terminal": stop_reason,
+                    }
+                )
+            else:
+                rendered_tempo.setdefault("prior_restored", True)
+                rendered_tempo.setdefault("turn_terminal", stop_reason)
+            nexus_meta["tempo"] = rendered_tempo
         field_meta = {"nexus": nexus_meta} if nexus_meta else None
         return PromptResponse(stop_reason=stop_reason, usage=usage, field_meta=field_meta)
 
